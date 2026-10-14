@@ -117,7 +117,15 @@ class CommandAdapter:
             session_id=self.session_id,
             text=text,
         )
-        result = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=120)
+        env = dict(os.environ)
+        env.update({
+            "AGENT_BUS_MESSAGE_ID": str(message["message_id"]),
+            "AGENT_BUS_THREAD_ID": str(message["thread_id"]),
+            "AGENT_BUS_FROM_AGENT": str(message["from_agent"]),
+            "AGENT_BUS_TO_AGENT": str(message["to_agent"]),
+            "AGENT_BUS_TEXT": text,
+        })
+        result = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=120, env=env, input=text)
         if result.returncode != 0:
             raise AdapterError((result.stderr or result.stdout or "notify command failed").strip())
 

@@ -137,7 +137,7 @@ python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter command --session-id "$ME
 ```
 
 Recognized placeholders: `{message_id}`, `{thread_id}`, `{from_agent}`, `{agent_id}`, `{session_id}`, `{text}`.
-Pointer-first is the safe default; `{text}` interpolation is the legacy/dangerous form. After a hook fires, read the full payload with `bus message show --agent-id <me> --message-id <id>`.
+Pointer-first is the safe default; `{text}` interpolation is the legacy/dangerous form. After a hook fires, read the full payload with `bus message show --agent-id <me> --message-id <id>`. Hooks also receive `AGENT_BUS_*` environment variables and stdin text, so they can avoid interpolation entirely.
 
 Ack semantics:
 - Hook exit 0 means "accepted", NOT "agent understood". Exit 0 only after durable local queueing.
