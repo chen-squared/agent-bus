@@ -81,6 +81,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
             attachments TEXT NOT NULL DEFAULT '[]',
             ttl_seconds INTEGER,
             expires_at REAL,
+            expects_response INTEGER NOT NULL DEFAULT 0,
+            response_deadline REAL,
+            nudge_count INTEGER NOT NULL DEFAULT 0,
             retry_count INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             status TEXT NOT NULL DEFAULT 'queued',
@@ -187,11 +190,21 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='group_read_state'").fetchone():
         if "last_digest_seq" not in columns("group_read_state"):
             conn.execute("ALTER TABLE group_read_state ADD COLUMN last_digest_seq INTEGER NOT NULL DEFAULT 0")
+    for col, ddl in (
+        ("expects_response", "ALTER TABLE messages ADD COLUMN expects_response INTEGER NOT NULL DEFAULT 0"),
+        ("response_deadline", "ALTER TABLE messages ADD COLUMN response_deadline REAL"),
+        ("nudge_count", "ALTER TABLE messages ADD COLUMN nudge_count INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if col not in columns("messages"):
+            conn.execute(ddl)
     conn.commit()
 
 
 def now() -> float:
     return time.time()
+
+NUDGE_FIRST_SECONDS = max(1, int(os.getenv("AGENT_BUS_NUDGE_FIRST", "60") or "60"))
+NUDGE_STEP_SECONDS = max(1, int(os.getenv("AGENT_BUS_NUDGE_STEP", "60") or "60"))
 
 
 def token_path(agent_id: str) -> Path:
@@ -863,9 +876,10 @@ def sweep_expired(conn: sqlite3.Connection) -> tuple[int, int]:
 
 def cmd_sweep(_args: argparse.Namespace) -> int:
     conn = connect()
-    expired, dead = sweep_expired(conn)
     stale_agents = sweep_agents(conn)
-    print(json_dumps({"ok": True, "expired": expired, "dead": dead, "stale_agents": stale_agents}))
+    nudged, stale = sweep_nudges(conn)
+    expired, dead = sweep_expired(conn)
+    print(json_dumps({"ok": True, "expired": expired, "dead": dead, "stale_agents": stale_agents, "nudged": nudged, "stale_asks": stale}))
     conn.close()
     return 0
 
@@ -929,6 +943,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         print(f"warning: {soft_warning}", file=sys.stderr)
     ttl = args.ttl if args.ttl is not None else 300
     expires = now_ts + ttl
+    expect_reply = bool(not getattr(args, "no_expect_reply", False))
+    response_deadline = now_ts + NUDGE_FIRST_SECONDS if expect_reply else None
     message_id = str(uuid.uuid4())
     payload = {"text": args.text, "kind": "ask"}
     if args.metadata:
@@ -939,8 +955,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
     conn.execute(
         """
         INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
-            payload,attachments,ttl_seconds,expires_at,retry_count,status,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,retry_count,status,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             message_id,
@@ -954,6 +970,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
             json_dumps(attachments),
             ttl,
             expires,
+            1 if expect_reply else 0,
+            response_deadline,
+            0,
             0,
             "queued",
             now_ts,
@@ -1004,8 +1023,14 @@ def cmd_ask(args: argparse.Namespace) -> int:
     timeout = args.timeout or 120
     deadline = time.time() + timeout
     answer_row = None
+    stale = False
     while time.time() < deadline:
+        sweep_nudges(conn)
         sweep_expired(conn)
+        status_row = conn.execute("SELECT status FROM messages WHERE message_id=?", (message_id,)).fetchone()
+        if status_row and status_row["status"] == "stale":
+            stale = True
+            break
         rows = conn.execute(
             """
             SELECT * FROM messages
@@ -1018,7 +1043,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
             answer_row = rows[0]
             break
         time.sleep(0.5)
-    if answer_row is not None:
+    if stale:
+        print(json_dumps({"ok": False, "stale": True, "message_id": message_id, "thread_id": thread_id, "hint": f"bus thread {thread_id}"}))
+    elif answer_row is not None:
         print(json_dumps({"ok": True, "message_id": message_id, "thread_id": thread_id, "answer": row_to_dict(answer_row)}))
     else:
         print(json_dumps({"ok": True, "timeout": True, "message_id": message_id, "thread_id": thread_id, "hint": f"bus thread {thread_id}"}))
@@ -1696,6 +1723,108 @@ def cmd_group_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def sweep_nudges(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Return (nudges, stale) counts for overdue asks without a linked answer."""
+    ts = now()
+    nudges = 0
+    stale = 0
+    asks = conn.execute(
+        """
+        SELECT * FROM messages
+        WHERE message_type='ask' AND expects_response=1
+          AND status IN ('queued','delivered','acked')
+          AND response_deadline IS NOT NULL
+          AND response_deadline <= ?
+          AND (expires_at IS NULL OR expires_at > ?)
+        """,
+        (ts, ts),
+    ).fetchall()
+    for ask in asks:
+        has_answer = conn.execute(
+            "SELECT 1 FROM messages WHERE answer_to_message_id=? LIMIT 1",
+            (ask["message_id"],),
+        ).fetchone() is not None
+        if has_answer:
+            conn.execute("UPDATE messages SET expects_response=0 WHERE message_id=?", (ask["message_id"],))
+            continue
+        ncount = int(ask["nudge_count"] or 0)
+        if ncount < 2:
+            deadline = ask["response_deadline"] if ask["response_deadline"] else ts
+            reminder_text = (
+                f"Reminder: unanswered ask {ask['message_id']} in thread {ask['thread_id']} "
+                f"is still pending. If handled elsewhere, send a pointer answer with "
+                f"bus answer --thread-id {ask['thread_id']} --from {ask['to_agent']} --text '...'. "
+                f"Otherwise reply now."
+            )
+            # system message to recipient
+            system_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
+                    payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,status,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    system_id,
+                    ask["thread_id"],
+                    None,
+                    "system",
+                    ask["to_agent"],
+                    "system",
+                    "normal",
+                    json_dumps({"text": reminder_text}),
+                    "[]",
+                    86400,
+                    ts + 86400,
+                    0,
+                    None,
+                    0,
+                    "queued",
+                    ts,
+                ),
+            )
+            await_nudge_backoff = NUDGE_STEP_SECONDS
+            conn.execute(
+                "UPDATE messages SET nudge_count=?, response_deadline=? WHERE message_id=?",
+                (ncount + 1, ts + await_nudge_backoff, ask["message_id"]),
+            )
+            nudges += 1
+        else:
+            notice_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
+                    payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,status,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    notice_id,
+                    ask["thread_id"],
+                    None,
+                    "system",
+                    ask["from_agent"],
+                    "system",
+                    "normal",
+                    json_dumps({"text": f"Ask {ask['message_id']} to {ask['to_agent']} is stale: no linked answer within nudge window."}),
+                    "[]",
+                    86400,
+                    ts + 86400,
+                    0,
+                    None,
+                    0,
+                    "queued",
+                    ts,
+                ),
+            )
+            conn.execute(
+                "UPDATE messages SET status='stale', expects_response=0, response_deadline=NULL, last_error=? WHERE message_id=?",
+                ("unanswered after nudges", ask["message_id"]),
+            )
+            stale += 1
+    conn.commit()
+    return nudges, stale
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="agent-bus generic message bus (v0)")
     parser.add_argument("--db", default=None, help="override database path")
@@ -1776,6 +1905,7 @@ def main() -> int:
     p.add_argument("--attachment", help="comma-separated file paths")
     p.add_argument("--metadata")
     p.add_argument("--wait", action="store_true")
+    p.add_argument("--no-expect-reply", action="store_true", help="do not monitor/remind for a response")
     p.set_defaults(func=cmd_ask)
 
     p = sub.add_parser("answer", help="answer an ask thread")

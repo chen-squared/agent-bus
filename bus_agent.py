@@ -311,9 +311,10 @@ def main() -> int:
                     argparse.Namespace(agent_id=agent_id, session_id=session_id, endpoint=session_id)
                 )
                 last_heartbeat = time.time()
-            # sweep expired and stale agents
-            bus.sweep_expired(conn)
+            # sweep expired and stale agents/tasks
             bus.sweep_agents(conn)
+            bus.sweep_nudges(conn)
+            bus.sweep_expired(conn)
 
             rows = bus.fetch_inbox(conn if False else None, agent_id, "undelivered", 25) if False else None
             # direct query simpler

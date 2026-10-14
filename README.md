@@ -147,7 +147,10 @@ Ack semantics:
 
 If an agent lacks a direct session API, inbox files and daemon endpoints work as fallback.
 
+Production sweep owner: a running `bus_agent.py` process also sweeps every poll interval; standalone watchers must arrange `python3 bus.py sweep` every 30–60s.
+
 ### Core rule
+asks expect answers: unanswered asks get up to two reminders then go stale with asker notice; waiters should use ask --wait which returns stale early; silence is a visible state not a void.
 
 If weak, discover the strong model, send a concise question with relevant file paths/digests, then wait and ack the answer. Do not write to other agents' session storage directly. Use the bus CLI.
 
