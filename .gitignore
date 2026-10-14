@@ -1,0 +1,18 @@
+# State and identity material
+tokens/
+bus.db
+bus.db-shm
+bus.db-wal
+*.token
+*.pid
+*.log
+*.out
+__pycache__/
+.DS_Store
+mailbox/
+blobs/
+probe-attachment.txt
+
+# Local test artifacts
+/prompts
+*.tmp
