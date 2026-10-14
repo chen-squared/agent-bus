@@ -14,6 +14,7 @@ import os
 import platform
 import secrets
 import sqlite3
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -202,6 +203,19 @@ def token_path(agent_id: str) -> Path:
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+AUDIT_LOG = Path("/Users/chen/Developer/agent-bus/bus_audit.log")
+
+
+def audit_log(event: str, **fields: Any) -> None:
+    line = json_dumps({"time": now(), "event": event, **{k: v for k, v in fields.items() if v is not None}})
+    print(line, file=sys.stderr)
+    try:
+        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def load_token(agent_id: str) -> str | None:
@@ -550,6 +564,75 @@ def ensure_thread(conn: sqlite3.Connection, thread_id: str, created_by: str | No
         conn.execute("UPDATE threads SET participants=? WHERE thread_id=?", (json_dumps(merged), thread_id))
 
 
+def cmd_message_show(args: argparse.Namespace) -> int:
+    conn = connect()
+    require_auth(conn, args.agent_id)
+    row = conn.execute("SELECT * FROM messages WHERE message_id=?", (args.message_id,)).fetchone()
+    if row is None:
+        conn.close()
+        raise SystemExit(f"error: message {args.message_id} not found")
+    from_agent = row["from_agent"]
+    to_agent = row["to_agent"]
+    if args.agent_id not in {from_agent, to_agent}:
+        audit_log("message_read_denied", requester=args.agent_id, target_message=args.message_id, parties=f"{from_agent}->{to_agent}")
+        conn.close()
+        raise SystemExit(f"error: denied: {args.agent_id} is not a participant of {args.message_id}")
+    audit_log("message_read_allowed", requester=args.agent_id, message_id=args.message_id, allowed=f"{from_agent}->{to_agent}")
+    print(json_dumps({"ok": True, "agent_id": args.agent_id, "message": row_to_dict(row)}))
+    conn.close()
+    return 0
+
+
+def cmd_thread(args: argparse.Namespace) -> int:
+    conn = connect()
+    require_auth(conn, args.agent_id)
+    if not conn.execute("SELECT 1 FROM agents WHERE agent_id=?", (args.agent_id,)).fetchone():
+        conn.close()
+        raise SystemExit(f"error: unknown agent {args.agent_id}")
+    thread = conn.execute("SELECT * FROM threads WHERE thread_id=?", (args.thread_id,)).fetchone()
+    if thread is None:
+        conn.close()
+        raise SystemExit(f"error: unknown thread {args.thread_id}")
+    participants = []
+    try:
+        participants = json.loads(thread["participants"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        participants = []
+    # Group thread fallback: if thread participants are coarse and a group
+    # owns the messages in this thread, use current group members on the home.
+    if not participants:
+        group_rows = {
+            r["group_id"]
+            for r in conn.execute("SELECT DISTINCT group_id FROM group_messages WHERE thread_id=? OR thread_id IS NULL", ()).fetchall()
+        }
+        pass
+    if args.agent_id not in participants:
+        # Allow access if this agent is the sender or original recipient of any
+        # message in the thread; group members retain history while members,
+        # and leaving members lose read on new messages but keep old history.
+        involved = conn.execute(
+            "SELECT 1 FROM messages WHERE thread_id=? AND (from_agent=? OR to_agent=?) LIMIT 1",
+            (args.thread_id, args.agent_id, args.agent_id),
+        ).fetchone()
+        if involved is None:
+            audit_log("thread_read_denied", requester=args.agent_id, thread_id=args.thread_id, participants=participants)
+            conn.close()
+            raise SystemExit(f"error: denied: {args.agent_id} is not a participant of {args.thread_id}")
+    audit_log("thread_read_allowed", requester=args.agent_id, thread_id=args.thread_id)
+    rows = conn.execute("SELECT * FROM messages WHERE thread_id=? ORDER BY created_at ASC, message_id ASC", (args.thread_id,)).fetchall()
+    print(
+        json_dumps(
+            {
+                "ok": True,
+                "thread": row_to_dict(thread),
+                "messages": [row_to_dict(r) for r in rows],
+            }
+        )
+    )
+    conn.close()
+    return 0
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     conn = connect()
     require_auth(conn, args.from_agent)
@@ -656,6 +739,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         conn.close()
         raise SystemExit(f"error: insert failed: {exc}")
     conn.commit()
+    audit_log("send", from_agent=args.from_agent, to_agent=args.to_agent, message_id=message_id, thread_id=thread_id)
     remote_result = None
     if remote_peer is not None:
         row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
@@ -742,25 +826,6 @@ def cmd_ack(args: argparse.Namespace) -> int:
     )
     conn.commit()
     print(json_dumps({"ok": True, "message_id": args.message_id, "acked_at": now()}))
-    conn.close()
-    return 0
-
-
-def cmd_thread(args: argparse.Namespace) -> int:
-    conn = connect()
-    rows = conn.execute(
-        "SELECT * FROM messages WHERE thread_id=? ORDER BY created_at ASC, message_id ASC", (args.thread_id,)
-    ).fetchall()
-    thread = conn.execute("SELECT * FROM threads WHERE thread_id=?", (args.thread_id,)).fetchone()
-    print(
-        json_dumps(
-            {
-                "ok": True,
-                "thread": row_to_dict(thread) if thread else None,
-                "messages": [row_to_dict(r) for r in rows],
-            }
-        )
-    )
     conn.close()
     return 0
 
@@ -895,6 +960,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         ),
     )
     conn.commit()
+    audit_log("send", from_agent=args.from_agent, to_agent=args.to_agent, message_id=message_id, thread_id=thread_id)
     remote_result = None
     if remote_peer is not None:
         row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
@@ -1028,6 +1094,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
         ),
     )
     conn.commit()
+    audit_log("send", from_agent=args.from_agent, to_agent=args.to_agent, message_id=message_id, thread_id=thread_id)
     remote_result = None
     if remote_peer is not None:
         row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
@@ -1456,6 +1523,7 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
         conn.close()
         raise SystemExit(f"error: unknown group {args.group_id}")
     if args.agent_id:
+        _group_require_member(conn, args.group_id, args.agent_id)
         state = conn.execute("SELECT last_read_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id)).fetchone()
         since = state["last_read_seq"] if state else 0
         limit = args.limit or 50
@@ -1464,11 +1532,8 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
             (args.group_id, since, limit),
         ).fetchall()
     else:
-        rows = conn.execute(
-            "SELECT * FROM group_messages WHERE group_id=? ORDER BY seq DESC LIMIT ?",
-            (args.group_id, args.limit or 50),
-        ).fetchall()
-        rows = list(reversed(rows))
+        conn.close()
+        raise SystemExit("error: denied: --agent-id is required for group messages read")
     latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
     print(json_dumps({"ok": True, "group_id": args.group_id, "latest_seq": latest, "count": len(rows), "messages": [row_to_dict(r) for r in rows]}))
     conn.close()
@@ -1674,7 +1739,15 @@ def main() -> int:
 
     p = sub.add_parser("thread", help="show thread")
     p.add_argument("thread_id")
+    p.add_argument("--agent-id", required=True)
     p.set_defaults(func=cmd_thread)
+
+    p = sub.add_parser("message", help="read a single message with ownership check")
+    m = p.add_subparsers(dest="message_command", required=True)
+    ms = m.add_parser("show", help="show one message")
+    ms.add_argument("--agent-id", required=True)
+    ms.add_argument("--message-id", required=True)
+    ms.set_defaults(func=cmd_message_show)
 
     p = sub.add_parser("agents", help="list agents")
     p.set_defaults(func=cmd_agents)

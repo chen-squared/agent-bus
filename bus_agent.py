@@ -255,7 +255,7 @@ def main() -> int:
     parser.add_argument("--adapter", default=os.environ.get("AGENT_BUS_ADAPTER", DEFAULT_ADAPTER))
     parser.add_argument("--session-id", default=os.environ.get("AGENT_BUS_SESSION"))
     parser.add_argument("--tmux-target", default=os.environ.get("TMUX_TARGET"))
-    parser.add_argument("--notify-cmd", default=os.environ.get("AGENT_NOTIFY_CMD"))
+    parser.add_argument("--notify-cmd", default=os.environ.get("AGENT_NOTIFY_CMD", "printf '{message_id} {thread_id} {from_agent}\\n'"))
     parser.add_argument("--cli", default=os.environ.get("AGENT_BUS_CLI", DEFAULT_CLI))
     parser.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD", "/Users/chen/Developer/agent-bus"))
     parser.add_argument("--poll", type=float, default=float(os.environ.get("AGENT_BUS_POLL", "1.0")))
@@ -285,7 +285,7 @@ def main() -> int:
         adapter = TmuxAdapter(args.tmux_target)
     elif adapter_kind == "command":
         if not args.notify_cmd:
-            raise SystemExit("error: --notify-cmd required for command adapter")
+            args.notify_cmd = "printf '{message_id} {thread_id} {from_agent}\\n'"
         adapter = CommandAdapter(args.notify_cmd, session_id or agent_id)
     else:
         raise SystemExit(f"error: unknown adapter {adapter_kind}")

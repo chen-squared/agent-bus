@@ -41,10 +41,10 @@ python3 "$BUS/bus.py" register --agent-id "$ME" --agent-type tmux --display-name
 nohup python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter tmux --tmux-target "$TARGET" > "$BUS/bus_agent_${ME}.log" 2>&1 &
 ```
 
-If you are using a generic command adapter:
+If you are using a generic command adapter, you only supply a one-shot hook for a single message. The listener loop is `bus_agent.py` below; do NOT write your own inbox poller:
 
 ```bash
-export AGENT_NOTIFY_CMD='my_notify {message_id} {text}'
+export AGENT_NOTIFY_CMD='printf "[%s|%s] %s: %s\n" "{thread_id}" "{message_id}" "{from_agent}" "{text}" >> /path/to/my-inbox.txt'
 python3 "$BUS/bus.py" register --agent-id "$ME" --agent-type cursor --display-name "$ME" --model-tier "$TIER" --capabilities "code-edit" --session-id "$ME" --endpoint "$ME"
 nohup python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter command --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" > "$BUS/bus_agent_${ME}.log" 2>&1 &
 ```
@@ -128,10 +128,10 @@ The CLI is universal. The adapter determines how delivery happens:
 - `command`: runs `AGENT_NOTIFY_CMD` template with placeholders; official generic reference path below
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
 
-Official generic watcher invocation:
+Official generic watcher invocation (`bus_agent.py` is the watcher; your hook handles one message, no custom loop):
 
 ```bash
-export AGENT_NOTIFY_CMD='cat >> /path/to/my-inbox.txt'
+export AGENT_NOTIFY_CMD='printf "[%s|%s] %s: %s\n" "{thread_id}" "{message_id}" "{from_agent}" "{text}" >> /path/to/my-inbox.txt'
 export BUS=/Users/chen/Developer/agent-bus
 python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter command --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" --poll 1
 ```
@@ -140,7 +140,7 @@ Recognized placeholders: `{message_id}`, `{thread_id}`, `{from_agent}`, `{agent_
 
 Ack semantics:
 - Hook exit 0 means "accepted", NOT "agent understood". Exit 0 only after durable local queueing.
-- Hooks run under `bash -lc`, so treat `{text}` as untrusted shell-adjacent data. Keep the template static and pass content as data; single-quote the text placeholder and never eval it.
+- Hooks run under `bash -lc`, so treat `{text}` as untrusted shell-adjacent data. Keep the template static and append-only; double-quote the text placeholder and never eval it. Residual risk, verified live: `$(...)`/backticks inside text still expand, so any bus sender can execute commands as the receiving agent user. Mitigations: join only trusted peers/groups, keep hooks side-effect-free appends, and the planned hardening is passing text via env/stdin instead of interpolation.
 - Keep hooks fast; a 120s hook blocks that agent poll loop.
 - Do not log secrets.
 
