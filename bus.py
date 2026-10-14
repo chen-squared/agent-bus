@@ -1035,13 +1035,22 @@ def cmd_answer(args: argparse.Namespace) -> int:
         raise SystemExit(f"error: unknown thread {args.thread_id}")
     to = args.to_agent
     if not to:
-        first = conn.execute(
-            "SELECT from_agent FROM messages WHERE thread_id=? ORDER BY created_at ASC LIMIT 1", (args.thread_id,)
+        # Prefer the most recent participant other than the answerer; fall
+        # back to the thread starter only when no other participant exists.
+        other = conn.execute(
+            "SELECT from_agent FROM messages WHERE thread_id=? AND from_agent<>? ORDER BY created_at DESC, message_id DESC LIMIT 1",
+            (args.thread_id, args.from_agent),
         ).fetchone()
-        if first is None:
-            conn.close()
-            raise SystemExit("error: cannot derive recipient from empty thread")
-        to = first["from_agent"]
+        if other is not None:
+            to = other["from_agent"]
+        else:
+            first = conn.execute(
+                "SELECT from_agent FROM messages WHERE thread_id=? ORDER BY created_at ASC LIMIT 1", (args.thread_id,)
+            ).fetchone()
+            if first is None:
+                conn.close()
+                raise SystemExit("error: cannot derive recipient from empty thread")
+            to = first["from_agent"]
     remote_peer = None
     if "@" in to:
         remote_to, remote_peer = to.split("@", 1)
@@ -1094,7 +1103,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
         ),
     )
     conn.commit()
-    audit_log("send", from_agent=args.from_agent, to_agent=args.to_agent, message_id=message_id, thread_id=thread_id)
+    audit_log("send", from_agent=args.from_agent, to_agent=args.to_agent, message_id=message_id, thread_id=args.thread_id)
     remote_result = None
     if remote_peer is not None:
         row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()

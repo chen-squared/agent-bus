@@ -238,3 +238,8 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
 
 Test status: local three-party drill passed (409/429/backpressure/digest).
 For non-opencode agents, use `command` adapter as the blessed generic watcher; tmux remains final fallback.
+
+
+### Trust boundary
+
+Tokens authenticate the **unix user**, not the AI agent. Same-user reads are an accepted v1 risk. Peer admission and group membership are the actual controls beyond the shared user.

@@ -44,7 +44,7 @@ nohup python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter tmux --tmux-target 
 If you are using a generic command adapter, you only supply a one-shot hook for a single message. The listener loop is `bus_agent.py` below; do NOT write your own inbox poller:
 
 ```bash
-export AGENT_NOTIFY_CMD='printf "[%s|%s] %s: %s\n" "{thread_id}" "{message_id}" "{from_agent}" "{text}" >> /path/to/my-inbox.txt'
+export AGENT_NOTIFY_CMD='printf "%s %s %s\\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
 python3 "$BUS/bus.py" register --agent-id "$ME" --agent-type cursor --display-name "$ME" --model-tier "$TIER" --capabilities "code-edit" --session-id "$ME" --endpoint "$ME"
 nohup python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter command --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" > "$BUS/bus_agent_${ME}.log" 2>&1 &
 ```
@@ -131,12 +131,13 @@ The CLI is universal. The adapter determines how delivery happens:
 Official generic watcher invocation (`bus_agent.py` is the watcher; your hook handles one message, no custom loop):
 
 ```bash
-export AGENT_NOTIFY_CMD='printf "[%s|%s] %s: %s\n" "{thread_id}" "{message_id}" "{from_agent}" "{text}" >> /path/to/my-inbox.txt'
+export AGENT_NOTIFY_CMD='printf "%s %s %s\\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
 export BUS=/Users/chen/Developer/agent-bus
 python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter command --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" --poll 1
 ```
 
 Recognized placeholders: `{message_id}`, `{thread_id}`, `{from_agent}`, `{agent_id}`, `{session_id}`, `{text}`.
+Pointer-first is the safe default; `{text}` interpolation is the legacy/dangerous form. After a hook fires, read the full payload with `bus message show --agent-id <me> --message-id <id>`.
 
 Ack semantics:
 - Hook exit 0 means "accepted", NOT "agent understood". Exit 0 only after durable local queueing.
@@ -149,3 +150,7 @@ If an agent lacks a direct session API, inbox files and daemon endpoints work as
 ### Core rule
 
 If weak, discover the strong model, send a concise question with relevant file paths/digests, then wait and ack the answer. Do not write to other agents' session storage directly. Use the bus CLI.
+
+### Trust boundary
+
+Tokens authenticate the local unix user, not the AI agent itself. A same-user process can therefore read the token and act as an agent; accept this as a v1 local trust-boundary risk. Peer admission and group membership are the real controls beyond the same user. Per-agent OS users are deferred.
