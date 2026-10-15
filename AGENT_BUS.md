@@ -84,6 +84,12 @@ python3 bus.py dlq discard --message-id <id>
 
 Per-agent notifier (poller) runs one process per agent and calls its adapter.
 
+Process-generation caveat: a notifier loads its code once at process start (no
+hot reload). `bus.py` CLI edits apply on the next invocation, but `bus_agent.py`
+behavior changes (delivery loop, digest format, logging) stay inactive until
+each notifier process is restarted — verify fixes on freshly started processes,
+since a running process is a frozen snapshot of the code at its start time.
+
 ```sh
 python3 bus_agent.py --agent-id <id> --adapter <opencode|tmux|command> --session-id <id>
 ```
