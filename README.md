@@ -134,6 +134,7 @@ python3 "$BUS/bus.py" group read --group-id demo-group --agent-id "$ME" --seq <n
 - 10 MB attachment cap by default (`AGENT_BUS_BLOB_MAX_BYTES` can change it).
 - Reminder cadence is tunable: `AGENT_BUS_NUDGE_FIRST` / `AGENT_BUS_NUDGE_STEP` (seconds, default 60 each); drills set both to seconds.
 - Group sends run four gates in order, each a JSON error on stderr (exit 1): read gate `must confirm latest message first` (keys on `last_read_seq`, which digests never advance — see Recovery), member rate gate `rate limited` (`--rate-seconds`, default 2s), group ceiling `group ceiling reached` (`--ceiling-per-minute`, default 120 messages/60s, retry after 5s), and backpressure `group backpressure: too many unread participants` (`--backlog-threshold`, default 50 members whose `last_read_seq` trails latest). Scope differs per gate: the read gate and the rate gate look only at you; the ceiling counts the whole group's last 60s; backpressure counts *other* members' unread backlog, so a member who never reads can block everyone else's sends.
+- Every numeric group flag honors an explicit `0`: `--rate-seconds 0`, `--ceiling-per-minute 0`, `--backlog-threshold 0`, `--max-members 0` all mean zero, not the default. They used to be rewritten to 2/120/50/50 by an `or` fallback, so a configured limit silently was not the configured limit.
 - Groups are intentionally moderate size, not mass-broadcast platforms.
 - `group close --group-id <g> --agent-id <owner>` marks a group closed; sends and digests stop immediately, only read access remains, and closed groups cannot be joined.
 - Leaving a group drops that member's `read_state`, so rejoining restarts digests from seq 0 in 5-message pages.
@@ -177,7 +178,7 @@ Production sweep owner: a running `bus_agent.py` process also sweeps every poll 
 ### Core rule
 Group digest self-exclusion: senders do not digest their own messages; the scan window (40) is wider than the 5-row render budget, and an own-only window advances the cursor to the scan end so external messages are not starved. The watch re-run must arrive with fresh traffic above the cursor.
 
-Join/leave security: join is authenticated against the joining token, self-declared roles are not honored on join, and leave authorizes the leaving agent. Group close is owner/admin only. `AGENT_BUS_DB` and `AGENT_BUS_TOKEN_DIR` isolate a second bus world; audit logging still defaults to one shared file (set `AGENT_BUS_AUDIT_LOG` per world).
+Join/leave security: join is authenticated against the joining token, an explicit non-`member` `--role` on join is rejected outright (it used to be accepted and then dropped, which read as success), and leave authorizes the leaving agent. Group close is owner/admin only. `AGENT_BUS_DB` and `AGENT_BUS_TOKEN_DIR` isolate a second bus world; audit logging still defaults to one shared file (set `AGENT_BUS_AUDIT_LOG` per world).
 asks expect answers: unanswered asks get up to two reminders then go stale with asker notice; waiters should use ask --wait which returns stale early; silence is a visible state not a void.
 
 If weak, discover the strong model, send a concise question with relevant file paths/digests, then wait and ack the answer. Do not write to other agents' session storage directly. Use the bus CLI.
@@ -185,5 +186,5 @@ If weak, discover the strong model, send a concise question with relevant file p
 ### Trust boundary
 
 Tokens authenticate the local unix user, not the AI agent itself.
-For group roles: join defaults to `member`; the `--role` option is ignored on join, roles are metadata only.
- A same-user process can therefore read the token and act as an agent; accept this as a v1 local trust-boundary risk. Peer admission and group membership are the real controls beyond the same user; note that join having auth and admission being open are two different claims, do not conflate them. Known-deferred: --role on join is ignored; every join lands as member, and rejoin never changes role. Initial roles come only from group create --owner. Per-agent OS users are deferred.
+For group roles: every join lands as `member`, and `--role` on join is rejected unless it says exactly `member`. Roles are not cosmetic — `group close` requires `owner`/`admin` or the group's `created_by`.
+ A same-user process can therefore read the token and act as an agent; accept this as a v1 local trust-boundary risk. Peer admission and group membership are the real controls beyond the same user; note that join having auth and admission being open are two different claims, do not conflate them. Roles are never elevated or changed by join, not even on rejoin; the only way to get an `owner` is `group create --owner`, and there is no promote/demote command yet. Per-agent OS users are deferred.

@@ -1515,10 +1515,13 @@ def cmd_group_create(args: argparse.Namespace) -> int:
                 args.topic,
                 machine_id(),
                 args.mode or "catch-up-gated",
-                args.max_members or 50,
+                # `or` here swallowed explicit zeros: --backlog-threshold 0 stored 50,
+                # --ceiling-per-minute 0 stored 120, --max-members 0 stored 50. A flag
+                # that silently becomes a different number is worse than a rejected one.
+                (args.max_members if args.max_members is not None else 50),
                 (args.rate_seconds if args.rate_seconds is not None else 2),
-                args.ceiling_per_minute or 120,
-                args.backlog_threshold or 50,
+                (args.ceiling_per_minute if args.ceiling_per_minute is not None else 120),
+                (args.backlog_threshold if args.backlog_threshold is not None else 50),
                 "active",
                 args.owner,
                 now_ts,
@@ -1557,6 +1560,17 @@ def cmd_group_join(args: argparse.Namespace) -> int:
     if count >= group["max_members"]:
         conn.close()
         raise SystemExit(f"error: group {args.group_id} is full")
+    # --role used to be accepted here and then dropped on the floor: the INSERT
+    # below writes "member" unconditionally, so `--role owner` landed a member and
+    # reported ok. A silently ignored privilege flag is worse than a rejected one,
+    # because the caller walks away believing it worked. Roles are assigned only at
+    # group create (--owner); join can never grant or change one.
+    if args.role is not None and args.role != "member":
+        conn.close()
+        raise SystemExit(
+            f"error: --role is not settable on join (got {args.role!r}); "
+            "every join lands as member, roles come only from group create --owner"
+        )
     rate = (args.rate_seconds if args.rate_seconds is not None else (group["rate_seconds"] if group["rate_seconds"] is not None else 2))
     now_ts = now()
     conn.execute(
@@ -1730,7 +1744,8 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         wait = round(rate - (now_ts - float(member["last_sent_at"])), 3)
         conn.close()
         raise SystemExit(json_dumps({"error": "rate limited", "retry_after_seconds": wait}))
-    ceiling = group["ceiling_per_minute"] or 120
+    # Same falsiness rule as cmd_group_create: a stored 0 means 0, not the default.
+    ceiling = group["ceiling_per_minute"] if group["ceiling_per_minute"] is not None else 120
     recent = conn.execute(
         "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND created_at>?",
         (args.group_id, now_ts - 60),
@@ -1746,11 +1761,9 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         """,
         (args.group_id, latest),
     ).fetchone()["c"]
-    if backlog > (group["backlog_threshold"] or 50):
+    if backlog > (group["backlog_threshold"] if group["backlog_threshold"] is not None else 50):
         conn.close()
         raise SystemExit(json_dumps({"error": "group backpressure: too many unread participants"}))
-    if group["max_members"] and False:
-        pass
     next_seq = latest + 1
     expires = now_ts + args.ttl if args.ttl else None
     message_id = str(uuid.uuid4())
@@ -2060,7 +2073,7 @@ def main() -> int:
     gj = g.add_parser("join", help="join group")
     gj.add_argument("--group-id", required=True)
     gj.add_argument("--agent-id", required=True)
-    gj.add_argument("--role", default="member")
+    gj.add_argument("--role", default=None, help="not settable on join: every join lands as member; roles come only from group create --owner")
     gj.add_argument("--rate-seconds", type=float)
     gj.set_defaults(func=cmd_group_join)
     gl = g.add_parser("leave", help="leave group")
