@@ -225,7 +225,7 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-AUDIT_LOG = Path("/Users/chen/Developer/agent-bus/bus_audit.log")
+AUDIT_LOG = Path(os.environ.get("AGENT_BUS_AUDIT_LOG", "/Users/chen/Developer/agent-bus/bus_audit.log"))
 
 
 def audit_log(event: str, **fields: Any) -> None:
@@ -1516,7 +1516,7 @@ def cmd_group_create(args: argparse.Namespace) -> int:
                 machine_id(),
                 args.mode or "catch-up-gated",
                 args.max_members or 50,
-                args.rate_seconds or 2,
+                (args.rate_seconds if args.rate_seconds is not None else 2),
                 args.ceiling_per_minute or 120,
                 args.backlog_threshold or 50,
                 "active",
@@ -1528,7 +1528,7 @@ def cmd_group_create(args: argparse.Namespace) -> int:
         if args.owner:
             conn.execute(
                 "INSERT INTO group_members (group_id,agent_id,role,rate_seconds,joined_at,status) VALUES (?,?,?,?,?,?)",
-                (args.group_id, args.owner, "owner", args.rate_seconds or 2, now_ts, "active"),
+                (args.group_id, args.owner, "owner", (args.rate_seconds if args.rate_seconds is not None else 2), now_ts, "active"),
             )
             conn.execute(
                 "INSERT INTO group_read_state (group_id,agent_id,last_read_seq,updated_at) VALUES (?,?,?,?)",
@@ -1557,7 +1557,7 @@ def cmd_group_join(args: argparse.Namespace) -> int:
     if count >= group["max_members"]:
         conn.close()
         raise SystemExit(f"error: group {args.group_id} is full")
-    rate = args.rate_seconds if args.rate_seconds is not None else group["rate_seconds"]
+    rate = (args.rate_seconds if args.rate_seconds is not None else (group["rate_seconds"] if group["rate_seconds"] is not None else 2))
     now_ts = now()
     conn.execute(
         """
@@ -1725,7 +1725,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         raise SystemExit("error: message text exceeds 64KB")
     if text_bytes > 1024 * 1024:
         pass
-    rate = member["rate_seconds"] or group["rate_seconds"] or 2
+    rate = (member["rate_seconds"] if member["rate_seconds"] is not None else (group["rate_seconds"] if group["rate_seconds"] is not None else 2))
     if member["last_sent_at"] and (now_ts - float(member["last_sent_at"])) < rate:
         wait = round(rate - (now_ts - float(member["last_sent_at"])), 3)
         conn.close()

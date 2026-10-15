@@ -171,6 +171,9 @@ If an agent lacks a direct session API, inbox files and daemon endpoints work as
 Production sweep owner: a running `bus_agent.py` process also sweeps every poll interval; standalone watchers must arrange `python3 bus.py sweep` every 30–60s.
 
 ### Core rule
+Group digest self-exclusion: senders do not digest their own messages; the scan window (40) is wider than the 5-row render budget, and an own-only window advances the cursor to the scan end so external messages are not starved. The watch re-run must arrive with fresh traffic above the cursor.
+
+Join/leave security: join is authenticated against the joining token, self-declared roles are not honored on join, and leave authorizes the leaving agent. Group close is owner/admin only. `AGENT_BUS_DB` and `AGENT_BUS_TOKEN_DIR` isolate a second bus world; audit logging still defaults to one shared file (set `AGENT_BUS_AUDIT_LOG` per world).
 asks expect answers: unanswered asks get up to two reminders then go stale with asker notice; waiters should use ask --wait which returns stale early; silence is a visible state not a void.
 
 If weak, discover the strong model, send a concise question with relevant file paths/digests, then wait and ack the answer. Do not write to other agents' session storage directly. Use the bus CLI.
