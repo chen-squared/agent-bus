@@ -109,6 +109,7 @@ python3 "$BUS/bus.py" blob get --sha256 <sha256> --output /local/path
   - `bus.py dlq list`
   - `bus.py dlq retry --message-id <id>`
   - or `bus.py dlq discard --message-id <id>`
+- Verification trap after upgrading digest code: a restarted notifier whose cursor already equals latest emits no new rows, so fresh group traffic is required to exercise the new path; zero new rows right after restart means no traffic, not a broken fix.
 
 Queued sends are stored, not synchronous-network. For `opencode` and watched `command` adapters a busy recipient is retried and reached later; for `tmux`, pane-busy consumes the retry budget and dead-letters after 5 attempts, so later delivery is not guaranteed there.
 
@@ -131,7 +132,7 @@ python3 "$BUS/bus.py" group read --group-id demo-group --agent-id "$ME" --seq <n
 - Group backpressure and sender-side ack gates can reject sends.
 - Groups are intentionally moderate size, not mass-broadcast platforms.
 
-For a `group-digest-*` pointer (group wake), resolve it with `bus group messages --group-id <thread-id> --agent-id <me>`; 1:1 pointers use `bus message show`. A pointer is only readable when its durable ack row exists.
+For a `group-digest-*` pointer (group wake), group-digest pointers: bus message show resolves them for active members (owner row when present, bounded reconstruction otherwise); `bus group messages` remains the universal fallback. 1:1 pointers use `bus message show`.
 ### Non-OpenCode agents
 
 The CLI is universal. The adapter determines how delivery happens:
@@ -141,7 +142,7 @@ The CLI is universal. The adapter determines how delivery happens:
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
 - For tmux: busy pane rejections no longer consume retry budget; use it only as final fallback, and note the idle check is a 0.3s heuristic, not a prompt-state gate.
 
-Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes and pulls full text via `bus message show` for 1-1 pointers, or `bus group messages --group-id <id>` for `group-digest-*` pointers, which are synthetic ids never stored in messages (text never crosses a shell). Bounded listener: wakes within seconds of arrival for any message landing inside the window after a turn ends (proven 103s post-turn, ~2s latency); messages arriving after the window expires wait for the next Stop event. Window is `AGENT_BUS_WAKE_LIMIT`, default 290s, under the 300s hook timeout.
+Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes and pulls full text via `bus message show` for 1-1 pointers, or for `group-digest-*` pointers (synthetic ids readable once their durable ack row exists, otherwise fall back to `bus group messages --group-id <id>`) (text never crosses a shell). Bounded listener: wakes within seconds of arrival for any message landing inside the window after a turn ends (proven 103s post-turn, ~2s latency); messages arriving after the window expires wait for the next Stop event. Window is `AGENT_BUS_WAKE_LIMIT`, default 290s, under the 300s hook timeout.
 
 Official generic watcher invocation (`bus_agent.py` is the watcher; your hook handles one message, no custom loop):
 
