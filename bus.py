@@ -212,6 +212,12 @@ def token_path(agent_id: str) -> Path:
     override = os.environ.get("AGENT_BUS_TOKEN_FILE")
     if override:
         return Path(override).expanduser()
+    # Directory-wide override, so a second project can run a fully separate bus
+    # world (own DB via AGENT_BUS_DB, own token namespace here) without colliding
+    # on agent_id or reading each other's tokens. TOKEN_DIR itself stays default.
+    base = os.environ.get("AGENT_BUS_TOKEN_DIR")
+    if base:
+        return Path(base).expanduser() / f"{agent_id}.token"
     return (TOKEN_DIR / f"{agent_id}.token").expanduser()
 
 
@@ -1544,6 +1550,9 @@ def cmd_group_join(args: argparse.Namespace) -> int:
     if group is None:
         conn.close()
         raise SystemExit(f"error: unknown group {args.group_id}")
+    if group["status"] != "active":
+        conn.close()
+        raise SystemExit(f"error: group {args.group_id} is {group['status']}")
     count = conn.execute("SELECT COUNT(*) AS c FROM group_members WHERE group_id=? AND status='active'", (args.group_id,)).fetchone()["c"]
     if count >= group["max_members"]:
         conn.close()
