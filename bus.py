@@ -663,6 +663,9 @@ def cmd_send(args: argparse.Namespace) -> int:
         target_stale = is_stale(to_row, now())
     # Make sure from can read token; auth done above.
     now_ts = now()
+    if not (args.text or "").strip():
+        conn.close()
+        raise SystemExit("error: message text must not be empty")
     ttl = args.ttl
     expires = now_ts + ttl if ttl else None
     thread_id = args.thread_id or str(uuid.uuid4())
