@@ -236,13 +236,23 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
 - Schema: groups, group_members, group_messages, group_read_state.
 - Monotonic per-group seq with sender-side acknowledge gate.
 - Throttling layers: per-sender rate, per-group ceiling, backpressure.
+- Sender-side acknowledge gate keys on `group_read_state.last_read_seq`, which the
+  notifier digest never advances; recovery is `group read --seq <latest_seq>`.
+- Gate rejections are JSON objects on stderr with empty stdout and exit 1. There is
+  no HTTP layer here, so there are no 409/429 statuses; the strings are
+  `must confirm latest message first`, `rate limited`, `group ceiling reached`,
+  `group backpressure: too many unread participants`.
 - Notifier digest: one digest per unseen watermark.
-- CLI: `group create/join/leave/list/messages/read/send/status`.
+- CLI: `group create/join/leave/close/list/messages/read/send/status`.
 - Multi-machine group increment 2 choose SSH restricted forced command;
   see `bus_ssh_gateway.py`, which pins sender identity and allowlists
   group commands only.
 
-Test status: local three-party drill passed (409/429/backpressure/digest).
+Test status: local three-party drill passed (read gate, rate gate, ceiling, backpressure, digest).
+Reproducible coverage lives in `probe_group_digest.py` (digest self-exclusion, cursor
+invariants, leave auth, token-namespace isolation) and `probe_group_gates.py` (join
+`--role` rejection, explicit-zero flags, gate error shapes); both drive the real CLI
+against a throwaway DB and token dir and must stay green.
 For non-opencode agents, use `command` adapter as the blessed generic watcher; tmux remains final fallback.
 
 
