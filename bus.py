@@ -1530,6 +1530,7 @@ def cmd_group_join(args: argparse.Namespace) -> int:
 def cmd_group_leave(args: argparse.Namespace) -> int:
     conn = connect()
     conn.execute("UPDATE group_members SET status='left' WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id))
+    conn.execute("DELETE FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id))
     conn.commit()
     print(json_dumps({"ok": True, "group_id": args.group_id, "agent_id": args.agent_id, "status": "left"}))
     conn.close()
@@ -1581,6 +1582,7 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
 
 def cmd_group_read(args: argparse.Namespace) -> int:
     conn = connect()
+    _group_require_member(conn, args.group_id, args.agent_id)
     latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
     seq = args.seq if args.seq is not None else latest
     if seq < 0 or seq > latest:
@@ -1662,7 +1664,11 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         conn.close()
         raise SystemExit(json_dumps({"error": "group ceiling reached", "retry_after_seconds": 5}))
     backlog = conn.execute(
-        "SELECT COUNT(*) AS c FROM group_read_state WHERE group_id=? AND last_read_seq < ?",
+        """
+        SELECT COUNT(*) AS c FROM group_read_state grs
+        JOIN group_members gm ON gm.group_id=grs.group_id AND gm.agent_id=grs.agent_id
+        WHERE grs.group_id=? AND gm.status='active' AND grs.last_read_seq < ?
+        """,
         (args.group_id, latest),
     ).fetchone()["c"]
     if backlog > (group["backlog_threshold"] or 50):
