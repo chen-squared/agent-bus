@@ -99,12 +99,16 @@ python3 "$BUS/bus.py" blob get --sha256 <sha256> --output /local/path
 
 ### 5. Recovery from bus errors
 
-- `409 must confirm latest message first`:
-  - call `bus.py group messages --group-id <g> --agent-id <me>`
-  - `bus.py group read --group-id <g> --agent-id <me> --seq <latest>`
-  - resend.
-- `429 rate limited`:
-  - honor `retry_after_seconds`, then retry.
+Group send gates are not HTTP statuses: each is a JSON object printed to **stderr** with **stdout empty** and exit code 1. Do not parse stdout for them.
+
+- `{"error":"must confirm latest message first","latest_seq":N,"last_read_seq":M,"last_digest_seq":K,"digest_health_hint":"..."}`:
+  - The gate compares your **self-reported** `last_read_seq` against `latest_seq`. The notifier's digest path advances `last_digest_seq` only, never `last_read_seq`, so a notifier that has digested everything up to latest is still blocked; `digest_health_hint` says exactly that (`digest path is healthy, only a manual read catch-up is missing`). A member's very first send after joining is always blocked this way.
+  - `bus.py group messages --group-id <g> --agent-id <me>` and take `.latest_seq` from the response. The `messages` array can be empty when you are already caught up — `latest_seq` is still correct.
+  - `bus.py group read --group-id <g> --agent-id <me> --seq <latest_seq>`. A seq above latest is rejected (`error: invalid seq N, latest is M`), so never hardcode or guess it.
+  - resend. A successful `group send` advances your own `last_read_seq` to your own new seq, so back-to-back sends by you alone do not re-arm the gate; it fires only when someone else posted since your last read or send.
+- `{"error":"rate limited","retry_after_seconds":N}`:
+  - per-member, per-group send spacing; default 2s. Honor `retry_after_seconds`, then retry.
+  - Set it per member with `group join --rate-seconds <s>` (group default from `group create --rate-seconds`). `0` is honored as zero, not as unset.
 - Dead or expired messages:
   - `bus.py dlq list`
   - `bus.py dlq retry --message-id <id>`
@@ -129,7 +133,7 @@ python3 "$BUS/bus.py" group read --group-id demo-group --agent-id "$ME" --seq <n
 - 64 KB hard cap for in-band text.
 - 10 MB attachment cap by default (`AGENT_BUS_BLOB_MAX_BYTES` can change it).
 - Reminder cadence is tunable: `AGENT_BUS_NUDGE_FIRST` / `AGENT_BUS_NUDGE_STEP` (seconds, default 60 each); drills set both to seconds.
-- Group backpressure and sender-side ack gates can reject sends.
+- Group sends run four gates in order, each a JSON error on stderr (exit 1): read gate `must confirm latest message first` (keys on `last_read_seq`, which digests never advance — see Recovery), member rate gate `rate limited` (`--rate-seconds`, default 2s), group ceiling `group ceiling reached` (`--ceiling-per-minute`, default 120 messages/60s, retry after 5s), and backpressure `group backpressure: too many unread participants` (`--backlog-threshold`, default 50 members whose `last_read_seq` trails latest). Scope differs per gate: the read gate and the rate gate look only at you; the ceiling counts the whole group's last 60s; backpressure counts *other* members' unread backlog, so a member who never reads can block everyone else's sends.
 - Groups are intentionally moderate size, not mass-broadcast platforms.
 - `group close --group-id <g> --agent-id <owner>` marks a group closed; sends and digests stop immediately, only read access remains, and closed groups cannot be joined.
 - Leaving a group drops that member's `read_state`, so rejoining restarts digests from seq 0 in 5-message pages.
