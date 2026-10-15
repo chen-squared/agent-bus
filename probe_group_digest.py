@@ -58,11 +58,18 @@ SENT = []
 def send(frm, text):
     """Real send path: the read-gate requires confirming latest before sending,
     and the member rate gate needs a small pause. Both are live behaviour, so the
-    probe honours them instead of bypassing them."""
+    probe honours them instead of bypassing them.
+
+    Confirming now requires having been served first: `group read` clamps to the
+    highest seq `group messages` actually returned, so the probe drains through the
+    real paging call before acking. Reading straight from sqlite would skip that
+    step and hide the clamp.
+    """
     import time
     last = ""
     for _ in range(8):
-        lat = conn.execute("SELECT COALESCE(MAX(seq),0) AS s FROM group_messages WHERE group_id='g1'").fetchone()["s"]
+        rc, out, err = cli("group", "messages", "--group-id", "g1", "--agent-id", frm, "--limit", "1000")
+        lat = json.loads(out)["latest_seq"] if rc == 0 else 0
         cli("group", "read", "--group-id", "g1", "--agent-id", frm, "--seq", str(lat))
         rc, out, err = cli("group", "send", "--from", frm, "--group-id", "g1", "--text", text)
         last = err or out

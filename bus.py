@@ -15,6 +15,7 @@ import re
 import platform
 import secrets
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.error
@@ -153,6 +154,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             agent_id TEXT NOT NULL,
             last_read_seq INTEGER NOT NULL DEFAULT 0,
             last_digest_seq INTEGER NOT NULL DEFAULT 0,
+            last_served_seq INTEGER NOT NULL DEFAULT 0,
             updated_at REAL NOT NULL,
             PRIMARY KEY (group_id, agent_id)
         );
@@ -189,8 +191,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE agents ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'unknown'")
     conn.execute("UPDATE agents SET machine_id=COALESCE(NULLIF(machine_id,'unknown'),?)", (machine_id(),))
     if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='group_read_state'").fetchone():
-        if "last_digest_seq" not in columns("group_read_state"):
-            conn.execute("ALTER TABLE group_read_state ADD COLUMN last_digest_seq INTEGER NOT NULL DEFAULT 0")
+        for col, ddl in (
+            ("last_digest_seq", "ALTER TABLE group_read_state ADD COLUMN last_digest_seq INTEGER NOT NULL DEFAULT 0"),
+            ("last_served_seq", "ALTER TABLE group_read_state ADD COLUMN last_served_seq INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in columns("group_read_state"):
+                conn.execute(ddl)
     for col, ddl in (
         ("expects_response", "ALTER TABLE messages ADD COLUMN expects_response INTEGER NOT NULL DEFAULT 0"),
         ("response_deadline", "ALTER TABLE messages ADD COLUMN response_deadline REAL"),
@@ -903,6 +909,104 @@ def cmd_agents(args: argparse.Namespace) -> int:
         item["heartbeat_age_seconds"] = (ts - float(r["last_heartbeat"])) if r["last_heartbeat"] else None
         items.append(item)
     print(json_dumps({"ok": True, "agents": items}))
+    conn.close()
+    return 0
+
+
+OPENCODE_CLI = os.environ.get(
+    "AGENT_BUS_CLI",
+    "/Users/chen/Library/Application Support/ai.opencode.desktop/cli/2.0.29-arm64/opencode-cli",
+)
+
+
+def _opencode_outcome(session_id: str) -> dict[str, Any]:
+    """Adapter-specific probe, NOT a bus signal.
+
+    The bus acks when the adapter's inject returns, which for opencode means the
+    server took the prompt; the model turn happens after that. opencode itself
+    records the turn outcome, so ask it. Returns {} plus probe_error on any failure
+    so the caller reports unknown rather than guessing.
+    """
+    if not session_id:
+        return {"probe_error": "no session id registered"}
+    try:
+        p = subprocess.run(
+            [OPENCODE_CLI, "api", "session.get", "--param", f"sessionID={session_id}"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"probe_error": f"{type(exc).__name__}: {exc}"}
+    if p.returncode != 0:
+        return {"probe_error": (p.stderr or p.stdout or "session.get failed").strip()[:300]}
+    try:
+        data = json.loads(p.stdout).get("data") or {}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return {"probe_error": "session.get returned non-JSON"}
+    return {
+        "outcome": data.get("outcome"),
+        "time_idle_ms": (data.get("time") or {}).get("idle"),
+        "turn_model": (data.get("model") or {}).get("id"),
+    }
+
+
+def cmd_liveness(args: argparse.Namespace) -> int:
+    """Report what the bus can and cannot prove about an agent being awake.
+
+    Heartbeat proves the notifier process is alive, never that a model answered.
+    Only opencode exposes a turn outcome, and only by asking opencode directly;
+    every other adapter reports unknown and falls back to round-trip evidence.
+    """
+    conn = connect()
+    row = conn.execute("SELECT * FROM agents WHERE agent_id=?", (args.agent_id,)).fetchone()
+    if row is None:
+        conn.close()
+        raise SystemExit(f"error: agent {args.agent_id} not registered")
+    ts = now()
+    out: dict[str, Any] = {
+        "ok": True,
+        "agent_id": args.agent_id,
+        "agent_type": row["agent_type"],
+        "bus_status": row["status"],
+        "notifier_heartbeat_age_seconds": (ts - float(row["last_heartbeat"])) if row["last_heartbeat"] else None,
+        "notifier_heartbeat_stale": is_stale(row, ts),
+    }
+    # Adapter-agnostic evidence: when did this agent last actually produce a
+    # message? Digest rows are injected INTO the agent with from_agent == the agent
+    # itself, so they must be excluded or a dead agent looks like it just spoke.
+    spoke = conn.execute(
+        "SELECT MAX(created_at) AS t FROM messages WHERE from_agent=? AND from_agent<>to_agent"
+        " AND message_type<>'system'",
+        (args.agent_id,),
+    ).fetchone()["t"]
+    gspoke = conn.execute(
+        "SELECT MAX(created_at) AS t FROM group_messages WHERE sender_agent=?", (args.agent_id,)
+    ).fetchone()["t"]
+    last_spoke = max([v for v in (spoke, gspoke) if v is not None], default=None)
+    out["last_spoke_age_seconds"] = (ts - last_spoke) if last_spoke is not None else None
+    out["open_asks"] = conn.execute(
+        "SELECT COUNT(*) AS c FROM messages WHERE to_agent=? AND message_type='ask'"
+        " AND status IN ('queued','delivered')",
+        (args.agent_id,),
+    ).fetchone()["c"]
+    if row["agent_type"] == "opencode":
+        probe = _opencode_outcome(row["endpoint"] or row["current_session_id"] or "")
+        out["model_liveness"] = probe.get("outcome") or "unknown"
+        out["liveness_source"] = "opencode session.get outcome (opencode's semantics, not the bus's)"
+        if probe.get("probe_error"):
+            out["probe_error"] = probe["probe_error"]
+        for k in ("time_idle_ms", "turn_model"):
+            if probe.get(k) is not None:
+                out[k] = probe[k]
+    else:
+        out["model_liveness"] = "unknown"
+        out["liveness_source"] = "none"
+        out["liveness_note"] = (
+            f"agent_type={row['agent_type']}: no adapter-level model probe exists. The bus only sees the "
+            "adapter's exit code, so a hook that exits 0 without waking a model is indistinguishable from "
+            "success. Use last_spoke_age_seconds and open_asks here, or a round-trip `ask --wait` that goes "
+            "stale, as the liveness signal."
+        )
+    print(json_dumps(out))
     conn.close()
     return 0
 
@@ -1655,7 +1759,12 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
         _group_require_member(conn, args.group_id, args.agent_id)
         state = conn.execute("SELECT last_read_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id)).fetchone()
         since = state["last_read_seq"] if state else 0
-        limit = args.limit or 50
+        # Explicit 0 means "counters only, no rows" -- same falsiness rule as the
+        # other numeric group flags, where `or 50` rewrote a configured 0.
+        limit = args.limit if args.limit is not None else 50
+        unread_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND seq>?", (args.group_id, since)
+        ).fetchone()["c"]
         rows = conn.execute(
             "SELECT * FROM group_messages WHERE group_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
             (args.group_id, since, limit),
@@ -1664,7 +1773,38 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
         conn.close()
         raise SystemExit("error: denied: --agent-id is required for group messages read")
     latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
-    print(json_dumps({"ok": True, "group_id": args.group_id, "latest_seq": latest, "count": len(rows), "messages": [row_to_dict(r) for r in rows]}))
+    # Record the high-water mark of what this call actually handed over. Without it
+    # `group read --seq <latest>` acknowledges rows the caller was never shown: the
+    # default --limit is 50 and the page is the OLDEST unread, so one capped call
+    # plus one read silently marks the tail as seen. `group read` clamps against
+    # this. The notifier digest path deliberately never writes it -- a digest is not
+    # a receipt for a gap the caller chose to acknowledge.
+    served_through = rows[-1]["seq"] if rows else 0
+    if served_through:
+        conn.execute(
+            """
+            INSERT INTO group_read_state (group_id,agent_id,last_served_seq,updated_at) VALUES (?,?,?,?)
+            ON CONFLICT(group_id,agent_id) DO UPDATE SET
+                last_served_seq=CASE WHEN excluded.last_served_seq>group_read_state.last_served_seq THEN excluded.last_served_seq ELSE group_read_state.last_served_seq END,
+                updated_at=excluded.updated_at
+            """,
+            (args.group_id, args.agent_id, served_through, now()),
+        )
+        conn.commit()
+    truncated = unread_total > len(rows)
+    if truncated:
+        span = f"seq {rows[0]['seq']}-{served_through}" if rows else "no rows at all"
+        print(
+            f"warning: returned {len(rows)} of {unread_total} unread ({span}); "
+            f"{unread_total - len(rows)} newer unread not shown. Ack through {served_through}, call again for the "
+            "rest, or raise --limit.",
+            file=sys.stderr,
+        )
+    print(json_dumps({
+        "ok": True, "group_id": args.group_id, "latest_seq": latest, "count": len(rows),
+        "unread_total": unread_total, "truncated": truncated, "served_through_seq": served_through,
+        "messages": [row_to_dict(r) for r in rows],
+    }))
     conn.close()
     return 0
 
@@ -1673,10 +1813,38 @@ def cmd_group_read(args: argparse.Namespace) -> int:
     conn = connect()
     _group_require_member(conn, args.group_id, args.agent_id)
     latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
-    seq = args.seq if args.seq is not None else latest
-    if seq < 0 or seq > latest:
+    requested = args.seq if args.seq is not None else latest
+    if requested < 0 or requested > latest:
         conn.close()
-        raise SystemExit(f"error: invalid seq {seq}, latest is {latest}")
+        raise SystemExit(f"error: invalid seq {requested}, latest is {latest}")
+    state = conn.execute(
+        "SELECT last_read_seq,last_served_seq FROM group_read_state WHERE group_id=? AND agent_id=?",
+        (args.group_id, args.agent_id),
+    ).fetchone()
+    cur = state["last_read_seq"] if state else 0
+    served = state["last_served_seq"] if state else 0
+    # Acknowledging a seq you were never served is the silent message-loss path:
+    # `group messages` pages the OLDEST unread rows (default --limit 50) while
+    # reporting `latest_seq`, so `read --seq <latest>` after one capped call burned
+    # the tail. The cursor now stops at the highest seq actually handed over, and
+    # the read gate keeps the caller honest about the rest.
+    ceiling = max(cur, served)
+    seq = requested
+    clamped = requested > ceiling and not args.allow_gap
+    if clamped:
+        seq = ceiling
+    elif requested > ceiling:
+        print(
+            f"warning: --allow-gap acks seq {ceiling + 1}-{requested} ({requested - ceiling} messages) that "
+            "group messages never returned to you.",
+            file=sys.stderr,
+        )
+    if clamped:
+        print(
+            f"warning: asked to ack seq {requested}, but group messages has only served you through {served}; "
+            f"cursor stopped at {seq}. Call group messages again for the rest, or pass --allow-gap.",
+            file=sys.stderr,
+        )
     conn.execute(
         """
         INSERT INTO group_read_state (group_id,agent_id,last_read_seq,updated_at)
@@ -1688,7 +1856,16 @@ def cmd_group_read(args: argparse.Namespace) -> int:
         (args.group_id, args.agent_id, seq, now()),
     )
     conn.commit()
-    print(json_dumps({"ok": True, "group_id": args.group_id, "agent_id": args.agent_id, "last_read_seq": seq, "latest_seq": latest}))
+    out = {
+        "ok": True, "group_id": args.group_id, "agent_id": args.agent_id, "last_read_seq": seq,
+        "latest_seq": latest, "requested_seq": requested, "served_through_seq": served,
+        "unacknowledged_seq_count": latest - seq,
+    }
+    if clamped:
+        out["clamped"] = True
+    if args.allow_gap and requested > ceiling:
+        out["gap_acked"] = requested - ceiling
+    print(json_dumps(out))
     conn.close()
     return 0
 
@@ -2007,6 +2184,10 @@ def main() -> int:
     p = sub.add_parser("agents", help="list agents")
     p.set_defaults(func=cmd_agents)
 
+    p = sub.add_parser("liveness", help="what the bus can and cannot prove about one agent being awake")
+    p.add_argument("--agent-id", required=True)
+    p.set_defaults(func=cmd_liveness)
+
     p = sub.add_parser("sweep", help="expire TTL messages and dead-letter retries")
     p.set_defaults(func=cmd_sweep)
 
@@ -2090,12 +2271,13 @@ def main() -> int:
     gm = g.add_parser("messages", help="list or read new group messages")
     gm.add_argument("--group-id", required=True)
     gm.add_argument("--agent-id")
-    gm.add_argument("--limit", type=int, default=50)
+    gm.add_argument("--limit", type=int, default=50, help="oldest unread rows to return; 0 means counters only")
     gm.set_defaults(func=cmd_group_messages)
-    gr = g.add_parser("read", help="ack latest seq as read")
+    gr = g.add_parser("read", help="ack seqs as read (clamped to what group messages actually served)")
     gr.add_argument("--group-id", required=True)
     gr.add_argument("--agent-id", required=True)
-    gr.add_argument("--seq", type=int)
+    gr.add_argument("--seq", type=int, help="default latest; clamped to last_served_seq unless --allow-gap")
+    gr.add_argument("--allow-gap", action="store_true", help="ack seqs that were never returned by group messages")
     gr.set_defaults(func=cmd_group_read)
     gs = g.add_parser("send", help="send a group message")
     gs.add_argument("--from", dest="from_agent", required=True)

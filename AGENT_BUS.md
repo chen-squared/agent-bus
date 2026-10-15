@@ -238,12 +238,24 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
 - Throttling layers: per-sender rate, per-group ceiling, backpressure.
 - Sender-side acknowledge gate keys on `group_read_state.last_read_seq`, which the
   notifier digest never advances; recovery is `group read --seq <latest_seq>`.
+- Three cursors, never writing each other: `last_read_seq` (self-reported, gates
+  sends), `last_digest_seq` (notifier render watermark), `last_served_seq` (highest
+  seq `group messages` actually returned). `group messages` pages oldest-first under
+  `--limit` (default 50) while reporting `latest_seq`, so `read --seq <latest>` after
+  one capped call used to burn the unseen tail. `group read` now clamps to
+  `max(last_read_seq, last_served_seq)` and warns; `--allow-gap` opts out explicitly.
 - Gate rejections are JSON objects on stderr with empty stdout and exit 1. There is
   no HTTP layer here, so there are no 409/429 statuses; the strings are
   `must confirm latest message first`, `rate limited`, `group ceiling reached`,
   `group backpressure: too many unread participants`.
 - Notifier digest: one digest per unseen watermark.
 - CLI: `group create/join/leave/close/list/messages/read/send/status`.
+- Liveness: `bus liveness --agent-id <id>` separates "notifier process alive" from
+  "model answered". `model_liveness` comes from opencode's `session.get` outcome for
+  `agent_type=opencode` only; every other adapter returns `unknown` with
+  `liveness_source:"none"`, because the bus sees only the adapter's exit code. The
+  adapter-agnostic fields (`last_spoke_age_seconds`, `open_asks`) are the honest
+  signal for `command` and `tmux`.
 - Multi-machine group increment 2 choose SSH restricted forced command;
   see `bus_ssh_gateway.py`, which pins sender identity and allowlists
   group commands only.
@@ -251,8 +263,9 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
 Test status: local three-party drill passed (read gate, rate gate, ceiling, backpressure, digest).
 Reproducible coverage lives in `probe_group_digest.py` (digest self-exclusion, cursor
 invariants, leave auth, token-namespace isolation) and `probe_group_gates.py` (join
-`--role` rejection, explicit-zero flags, gate error shapes); both drive the real CLI
-against a throwaway DB and token dir and must stay green.
+`--role` rejection, explicit-zero flags, gate error shapes, and the 60-unread paging
+case where `read --seq <latest>` must clamp to 50 instead of burning seqs 51-60); both
+drive the real CLI against a throwaway DB and token dir and must stay green.
 For non-opencode agents, use `command` adapter as the blessed generic watcher; tmux remains final fallback.
 
 

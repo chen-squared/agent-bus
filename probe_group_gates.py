@@ -53,6 +53,17 @@ def gate_err(stderr):
         return None
 
 
+def drain(who, gid, limit="1000"):
+    """Page the unread window the way a real member must, and return latest_seq.
+
+    `group read` clamps to the highest seq this call actually returned, so anything
+    that wants to ack latest has to be served first. Reading seqs straight out of
+    sqlite would skip that step and hide the clamp.
+    """
+    rc, out, err = cli("group", "messages", "--group-id", gid, "--agent-id", who, "--limit", limit)
+    return (json.loads(out) if rc == 0 else {}).get("latest_seq", 0)
+
+
 def send(who, gid, text):
     """Send the way a real agent must: confirm latest first, then post.
 
@@ -61,6 +72,7 @@ def send(who, gid, text):
     """
     rc, out, err = cli("group", "send", "--from", who, "--group-id", gid, "--text", text)
     if rc != 0 and "must confirm latest message first" in err:
+        drain(who, gid)
         latest = (gate_err(err) or {}).get("latest_seq")
         rc2, out2, err2 = cli("group", "read", "--group-id", gid, "--agent-id", who, "--seq", str(latest))
         if rc2 != 0:
@@ -128,8 +140,9 @@ rc, out, err = cli("group", "send", "--from", "alice", "--group-id", "bp", "--te
 g = gate_err(err)
 check("bob 未读时第二条被背压拦（旧行为阈值 50，永不触发）",
       rc != 0 and (g or {}).get("error") == "group backpressure: too many unread participants", err or out)
+drain("bob", "bp")
 rc, out, err = cli("group", "read", "--group-id", "bp", "--agent-id", "bob", "--seq", "1")
-check("bob 补读到 seq1", rc == 0, err or out)
+check("bob 补读到 seq1（先经 group messages 取到才生效）", rc == 0 and "clamped" not in json.loads(out), err or out)
 rc, out, err = cli("group", "send", "--from", "alice", "--group-id", "bp", "--text", "m3")
 check("bob 补读后放行", rc == 0, err or out)
 
@@ -175,8 +188,9 @@ rc, out, err = cli("group", "read", "--group-id", "gates", "--agent-id", "bob", 
 check("bob 补读到 latest", rc == 0, err or out)
 rc, out, err = cli("group", "send", "--from", "bob", "--group-id", "gates", "--text", "m2")
 check("补读后 bob 首发成功", rc == 0, err or out)
+drain("alice", "gates")
 rc, out, err = cli("group", "read", "--group-id", "gates", "--agent-id", "alice", "--seq", "2")
-check("alice 补读到 bob 的 seq2", rc == 0, err or out)
+check("alice 补读到 bob 的 seq2", rc == 0 and "clamped" not in json.loads(out), err or out)
 rc, out, err = cli("group", "send", "--from", "alice", "--group-id", "gates", "--text", "m3")
 check("补读后 alice 发 m3", rc == 0, err or out)
 rc, out, err = cli("group", "send", "--from", "alice", "--group-id", "gates", "--text", "m4")
@@ -202,6 +216,65 @@ for i in range(6):
 check("rate 0 时 6 条连发全部成功（read-gate 已按规矩补读）", not fails, str(fails[:2]))
 check("rate 0 时确实没有 rate limited",
       not any("rate limited" in e for _, e in fails), str(fails[:2]))
+
+print("M read 游标被 group messages 实际给到的位置夹住，不再跨过没看过的尾部")
+rc, out, err = cli("group", "create", "--from", "alice", "--group-id", "page", "--topic", "t",
+                   "--rate-seconds", "0", "--ceiling-per-minute", "1000", "--backlog-threshold", "1000")
+check("create page", rc == 0, err or out)
+for who in ("bob", "carol"):
+    rc, out, err = cli("group", "join", "--group-id", "page", "--agent-id", who, "--rate-seconds", "0")
+    check(f"join page {who}", rc == 0, err or out)
+sent = 0
+for i in range(60):
+    rc, out, err = cli("group", "send", "--from", "alice", "--group-id", "page", "--text", f"p{i}")
+    if rc == 0:
+        sent += 1
+check("alice 连发 60 条", sent == 60, f"sent={sent} {err[:120]}")
+
+rc, out, err = cli("group", "messages", "--group-id", "page", "--agent-id", "bob")
+mv = json.loads(out)
+check("默认 --limit 50 只给最旧的 50 条",
+      mv["count"] == 50 and mv["messages"][0]["seq"] == 1 and mv["messages"][-1]["seq"] == 50, str(mv)[:160])
+check("响应自报 unread_total / truncated / served_through_seq",
+      mv["unread_total"] == 60 and mv["truncated"] is True and mv["served_through_seq"] == 50, str(mv)[:160])
+check("截断时 stderr 有 warning，stdout 仍是纯 JSON", "warning:" in err and out.startswith("{"), err[:160])
+
+rc, out, err = cli("group", "read", "--group-id", "page", "--agent-id", "bob", "--seq", "60")
+mv = json.loads(out)
+check("read --seq 60 被夹到 50（旧行为一步跨到 60，51-60 无声变成已读）",
+      mv["last_read_seq"] == 50 and mv.get("clamped") is True and mv["unacknowledged_seq_count"] == 10, str(mv))
+check("夹住时 stderr 说明只给到 50", "served you through 50" in err, err[:200])
+rc, out, err = cli("group", "send", "--from", "bob", "--group-id", "page", "--text", "x")
+check("游标没到 latest，bob 发信仍被 read-gate 拦",
+      rc != 0 and (gate_err(err) or {}).get("error") == "must confirm latest message first", err or out)
+rc, out, err = cli("group", "messages", "--group-id", "page", "--agent-id", "bob")
+mv = json.loads(out)
+check("第二轮拿到 51-60",
+      mv["count"] == 10 and mv["messages"][0]["seq"] == 51 and mv["truncated"] is False, str(mv)[:160])
+rc, out, err = cli("group", "read", "--group-id", "page", "--agent-id", "bob", "--seq", "60")
+mv = json.loads(out)
+check("排空后 read --seq 60 不再被夹", mv["last_read_seq"] == 60 and "clamped" not in mv, str(mv))
+rc, out, err = cli("group", "send", "--from", "bob", "--group-id", "page", "--text", "x")
+check("排空后 bob 发信放行", rc == 0, err or out)
+
+rc, out, err = cli("group", "messages", "--group-id", "page", "--agent-id", "carol", "--limit", "0")
+mv = json.loads(out)
+check("--limit 0 是显式 0（只给计数，不再被 or 改写成 50）",
+      mv["count"] == 0 and mv["unread_total"] == mv["latest_seq"] and mv["truncated"] is True
+      and "warning:" in err, str(mv)[:160])
+check("--limit 0 不推进 served_through_seq", mv["served_through_seq"] == 0, str(mv)[:160])
+# bob posted while the checks above ran, so pin to the latest this member can see.
+LATEST_NOW = str(mv["latest_seq"])
+rc, out, err = cli("group", "read", "--group-id", "page", "--agent-id", "carol", "--seq", LATEST_NOW)
+mv = json.loads(out)
+check("从未被服务过的成员 read 夹到 0", mv["last_read_seq"] == 0 and mv.get("clamped") is True, str(mv))
+rc, out, err = cli("group", "read", "--group-id", "page", "--agent-id", "carol", "--seq", LATEST_NOW, "--allow-gap")
+mv = json.loads(out)
+check("--allow-gap 显式跨 gap 时落库到 latest 并警告",
+      mv["last_read_seq"] == int(LATEST_NOW) and mv.get("gap_acked") == int(LATEST_NOW) and "never returned" in err,
+      str(mv) + " | " + err[:200])
+rc, out, err = cli("group", "send", "--from", "carol", "--group-id", "page", "--text", "y")
+check("allow-gap 后 carol 发信放行", rc == 0, err or out)
 
 print(f"\nRESULT: {'ALL PASS' if not FAIL else str(len(FAIL)) + ' FAILED: ' + repr(FAIL)}")
 sys.exit(0 if not FAIL else 1)
