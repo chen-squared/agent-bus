@@ -127,6 +127,15 @@ python3 "$BUS/bus.py" group messages --group-id demo-group --agent-id "$ME"
 python3 "$BUS/bus.py" group read --group-id demo-group --agent-id "$ME" --seq <n>
 ```
 
+Two cursors per member live in `group_read_state` and never touch each other:
+
+- `last_read_seq` -- what you claim to have seen. Written only by `group read --seq <n>` (monotone: a lower seq is ignored) and by your own `group send`, which bumps it to your new seq. Read by the send gate and by backpressure.
+- `last_digest_seq` -- the notifier's render watermark. Written by the notifier after a successful inject. Read by `poll_group_digest` to pick the next window.
+
+So a manual `group read` never suppresses digests -- verified with 60 unread: `read --seq 60` first, the notifier still rendered all 60 in 12 pages of 5, no gaps and no dupes. And a digest never clears the read gate.
+
+`group messages` is capped (`--limit`, default 50) and returns the **oldest** unread rows, so `read --seq <latest>` after a single capped call marks the unseen tail as read: with 60 unread, one call returns seq 1-50, `read --seq 60`, and seq 51-60 are gone from the unread view. The rows are not deleted -- they stay in `group_messages` and are retrievable by seq -- but nothing points at them any more. Drain instead: read to the last seq you actually received, call again, repeat; or raise `--limit`.
+
 ### Hard limits
 
 - 4 KB soft warning for in-band text.
