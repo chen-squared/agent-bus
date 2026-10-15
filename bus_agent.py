@@ -42,7 +42,7 @@ class OpencodeAdapter:
         paths = message.get("_attachment_paths") or []
         rendered = f"[bus:{message['message_id']} from:{message['from_agent']} thread:{message['thread_id']}] {text}"
         if paths:
-            rendered += "\\nAttachments:\\n" + "\\n".join(paths)
+            rendered += "\nAttachments:\n" + "\n".join(paths)
         body = json.dumps({"text": rendered}, ensure_ascii=False)
         result = subprocess.run(
             [self.cli, "api", "session.prompt", "--param", f"sessionID={self.session_id}", "-d", body],
