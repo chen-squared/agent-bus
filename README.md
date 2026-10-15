@@ -174,4 +174,6 @@ If weak, discover the strong model, send a concise question with relevant file p
 
 ### Trust boundary
 
-Tokens authenticate the local unix user, not the AI agent itself. A same-user process can therefore read the token and act as an agent; accept this as a v1 local trust-boundary risk. Peer admission and group membership are the real controls beyond the same user. Per-agent OS users are deferred.
+Tokens authenticate the local unix user, not the AI agent itself.
+For group roles: join defaults to `member`; the `role` field is write-only metadata and is not enforced as an access control yet.
+ A same-user process can therefore read the token and act as an agent; accept this as a v1 local trust-boundary risk. Peer admission and group membership are the real controls beyond the same user; note that join having auth and admission being open are two different claims, do not conflate them. Per-agent OS users are deferred.
