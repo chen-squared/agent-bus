@@ -256,6 +256,32 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
 
 def commit_group_digest(conn: sqlite3.Connection, agent_id: str, message: dict[str, Any]) -> None:
     """Advance the digest cursor, but only once the adapter accepted the digest."""
+    now_ts = time.time()
+    payload = json.loads(message["payload"])
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,
+            message_type,urgency,payload,attachments,ttl_seconds,expires_at,status,delivered_at,acked_at,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            message["message_id"],
+            message["thread_id"],
+            None,
+            message["from_agent"],
+            message["to_agent"],
+            "system",
+            "normal",
+            json.dumps(payload, ensure_ascii=False),
+            "[]",
+            86400,
+            now_ts + 86400,
+            "acked",
+            now_ts,
+            now_ts,
+            now_ts,
+        ),
+    )
     conn.execute(
         """
         UPDATE group_read_state

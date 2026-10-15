@@ -131,6 +131,7 @@ python3 "$BUS/bus.py" group read --group-id demo-group --agent-id "$ME" --seq <n
 - Group backpressure and sender-side ack gates can reject sends.
 - Groups are intentionally moderate size, not mass-broadcast platforms.
 
+For a `group-digest-*` pointer (group wake), resolve it with `bus group messages --group-id <thread-id> --agent-id <me>`; 1:1 pointers use `bus message show`. A pointer is only readable when its durable ack row exists.
 ### Non-OpenCode agents
 
 The CLI is universal. The adapter determines how delivery happens:
@@ -140,7 +141,7 @@ The CLI is universal. The adapter determines how delivery happens:
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
 - For tmux: busy pane rejections no longer consume retry budget; use it only as final fallback, and note the idle check is a 0.3s heuristic, not a prompt-state gate.
 
-Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes at the turn boundary and pulls full text via `bus message show` (text never crosses a shell). Bounded listener: wakes within seconds of arrival for any message landing inside the window after a turn ends (proven 103s post-turn, ~2s latency); messages arriving after the window expires wait for the next Stop event. Window is `AGENT_BUS_WAKE_LIMIT`, default 290s, under the 300s hook timeout.
+Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes and pulls full text via `bus message show` for 1-1 pointers, or `bus group messages --group-id <id>` for `group-digest-*` pointers, which are synthetic ids never stored in messages (text never crosses a shell). Bounded listener: wakes within seconds of arrival for any message landing inside the window after a turn ends (proven 103s post-turn, ~2s latency); messages arriving after the window expires wait for the next Stop event. Window is `AGENT_BUS_WAKE_LIMIT`, default 290s, under the 300s hook timeout.
 
 Official generic watcher invocation (`bus_agent.py` is the watcher; your hook handles one message, no custom loop):
 
