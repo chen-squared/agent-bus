@@ -16,3 +16,7 @@ probe-attachment.txt
 # Local test artifacts
 /prompts
 *.tmp
+
+# Bus watcher state
+.bus_inbox_*
+.claude/settings.local.json
