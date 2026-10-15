@@ -1549,18 +1549,22 @@ def cmd_group_join(args: argparse.Namespace) -> int:
         raise SystemExit(f"error: group {args.group_id} is full")
     rate = args.rate_seconds if args.rate_seconds is not None else group["rate_seconds"]
     now_ts = now()
-    try:
-        conn.execute(
-            "INSERT INTO group_members (group_id,agent_id,role,rate_seconds,joined_at,status) VALUES (?,?,?,?,?,?)",
-            (args.group_id, args.agent_id, args.role or "member", rate, now_ts, "active"),
-        )
-        conn.execute(
-            "INSERT INTO group_read_state (group_id,agent_id,last_read_seq,updated_at) VALUES (?,?,?,?)",
-            (args.group_id, args.agent_id, 0, now_ts),
-        )
-    except sqlite3.IntegrityError:
-        conn.close()
-        raise SystemExit(f"error: {args.agent_id} already in {args.group_id}")
+    conn.execute(
+        """
+        INSERT INTO group_members (group_id,agent_id,role,rate_seconds,joined_at,status)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(group_id,agent_id) DO UPDATE SET
+            role=excluded.role,
+            rate_seconds=excluded.rate_seconds,
+            joined_at=excluded.joined_at,
+            status='active'
+        """,
+        (args.group_id, args.agent_id, args.role or "member", rate, now_ts, "active"),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO group_read_state (group_id,agent_id,last_read_seq,updated_at) VALUES (?,?,?,?)",
+        (args.group_id, args.agent_id, 0, now_ts),
+    )
     conn.commit()
     print(json_dumps({"ok": True, "group_id": args.group_id, "agent_id": args.agent_id}))
     conn.close()
