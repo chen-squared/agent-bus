@@ -700,9 +700,6 @@ def cmd_send(args: argparse.Namespace) -> int:
                     "path": str(p.resolve()),
                 }
                 attachments.append(manifest)
-    if not (args.text or "").strip():
-        conn.close()
-        raise SystemExit("error: group message text must not be empty")
     text_bytes = len(args.text.encode("utf-8"))
     if text_bytes > 64 * 1024:
         print("error: message text exceeds 64KB", file=sys.stderr)
@@ -1625,6 +1622,9 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         raise SystemExit(
             json_dumps({"error": "must confirm latest message first", "latest_seq": latest, "last_read_seq": last_read})
         )
+    if not (args.text or "").strip():
+        conn.close()
+        raise SystemExit("error: group message text must not be empty")
     text_bytes = len(args.text.encode("utf-8"))
     if text_bytes > 64 * 1024:
         conn.close()
