@@ -86,8 +86,8 @@ class TmuxAdapter:
         paths = message.get("_attachment_paths") or []
         text = f"[bus:{message['message_id']} from:{message['from_agent']} thread:{message['thread_id']}] {payload.get('text','')}"
         if paths:
-            text += "\\nAttachments:\\n" + "\\n".join(paths)
-        subprocess.run(["tmux", "send-keys", "-t", self.target, text], check=True)
+            text += "\nAttachments:\n" + "\n".join(paths)
+        subprocess.run(["tmux", "send-keys", "-t", self.target, "-l", text], check=True)
         time.sleep(0.1)
         subprocess.run(["tmux", "send-keys", "-t", self.target, "Enter"], check=True)
 
@@ -358,6 +358,22 @@ def main() -> int:
                     conn.commit()
                     bus.cmd_ack(argparse.Namespace(agent_id=agent_id, message_id=msg["message_id"]))
                     log(f"delivered+acked {msg['message_id']} from {msg['from_agent']}", agent_id)
+                except AdapterError as exc:
+                    if "busy" in str(exc).lower():
+                        log(f"target busy, deferring {msg['message_id']}; retry_count untouched", agent_id)
+                    else:
+                        conn.execute(
+                            "UPDATE messages SET retry_count=retry_count+1, last_error=? WHERE message_id=?",
+                            (str(exc)[:500], msg["message_id"]),
+                        )
+                        conn.commit()
+                        row2 = conn.execute("SELECT retry_count FROM messages WHERE message_id=?", (msg["message_id"],)).fetchone()
+                        if row2 and row2["retry_count"] >= 5:
+                            conn.execute("UPDATE messages SET status='dead' WHERE message_id=?", (msg["message_id"],))
+                            conn.commit()
+                            log(f"dead-letter {msg['message_id']}: {exc}", agent_id)
+                        else:
+                            log(f"delivery failed {msg['message_id']}: {exc}", agent_id)
                 except Exception as exc:
                     conn.execute(
                         "UPDATE messages SET retry_count=retry_count+1, last_error=? WHERE message_id=?",

@@ -110,7 +110,7 @@ python3 "$BUS/bus.py" blob get --sha256 <sha256> --output /local/path
   - `bus.py dlq retry --message-id <id>`
   - or `bus.py dlq discard --message-id <id>`
 
-Strong sends are queued, not synchronous-network, so even if the recipient is busy, it will later be delivered.
+Queued sends are stored, not synchronous-network. For `opencode` and watched `command` adapters a busy recipient is retried and reached later; for `tmux`, pane-busy consumes the retry budget and dead-letters after 5 attempts, so later delivery is not guaranteed there.
 
 ### 6. Group chat
 
@@ -138,6 +138,9 @@ The CLI is universal. The adapter determines how delivery happens:
 - `opencode`: session.prompt on a session id
 - `command`: runs `AGENT_NOTIFY_CMD` template with placeholders; official generic reference path below
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
+- For tmux: busy pane rejections no longer consume retry budget; use it only as final fallback, and note the idle check is a 0.3s heuristic, not a prompt-state gate.
+
+Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes at the turn boundary and pulls full text via `bus message show` (text never crosses a shell). Bounded listener: wakes within seconds of arrival for any message landing inside the window after a turn ends (proven 103s post-turn, ~2s latency); messages arriving after the window expires wait for the next Stop event. Window is `AGENT_BUS_WAKE_LIMIT`, default 290s, under the 300s hook timeout.
 
 Official generic watcher invocation (`bus_agent.py` is the watcher; your hook handles one message, no custom loop):
 
@@ -153,6 +156,7 @@ Pointer-first is the safe default; `{text}` interpolation is the legacy/dangerou
 Ack semantics:
 - Hook exit 0 means "accepted", NOT "agent understood". Exit 0 only after durable local queueing.
 - Hooks run under `bash -lc`, so treat `{text}` as untrusted shell-adjacent data. Keep the template static and append-only; double-quote the text placeholder and never eval it. Residual risk, verified live: `$(...)`/backticks inside text still expand, so any bus sender can execute commands as the receiving agent user. Prefer the pointer triple plus stdin/`AGENT_BUS_*` env (already shipped) over interpolation entirely. Mitigations: join only trusted peers/groups, keep hooks side-effect-free appends.
+- Shell-expansion hazard applies to every send, not only hooks: every agent composes sends through a shell. Single-quote outbound text or write it to a file first. Corruption triage, verified live: HOLES in stored text mean outbound shell expansion (a `$...`/backtick token expanded to empty); garbled bytes mean encoding; missing head means mid-turn tmux injection. Only the third is a bus bug.
 - Keep hooks fast; a 120s hook blocks that agent poll loop.
 - Restart notifiers one at a time; killing every agent process together can cause 1-2 minute offline windows. Verify replacement processes before stopping the old one.
 - Do not log secrets.
