@@ -1539,6 +1539,10 @@ def cmd_group_create(args: argparse.Namespace) -> int:
 
 def cmd_group_join(args: argparse.Namespace) -> int:
     conn = connect()
+    require_auth(conn, args.from_agent)
+    if args.from_agent != args.agent_id:
+        conn.close()
+        raise SystemExit("error: --agent-id must match --from (token bound to the agent)")
     group = conn.execute("SELECT * FROM groups WHERE group_id=?", (args.group_id,)).fetchone()
     if group is None:
         conn.close()
@@ -1554,10 +1558,9 @@ def cmd_group_join(args: argparse.Namespace) -> int:
         INSERT INTO group_members (group_id,agent_id,role,rate_seconds,joined_at,status)
         VALUES (?,?,?,?,?,?)
         ON CONFLICT(group_id,agent_id) DO UPDATE SET
-            role=excluded.role,
+            status='active',
             rate_seconds=excluded.rate_seconds,
-            joined_at=excluded.joined_at,
-            status='active'
+            joined_at=excluded.joined_at
         """,
         (args.group_id, args.agent_id, args.role or "member", rate, now_ts, "active"),
     )
