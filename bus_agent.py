@@ -268,7 +268,7 @@ def commit_group_digest(conn: sqlite3.Connection, agent_id: str, message: dict[s
             message["message_id"],
             message["thread_id"],
             None,
-            message["from_agent"],
+            agent_id,
             message["to_agent"],
             "system",
             "normal",
