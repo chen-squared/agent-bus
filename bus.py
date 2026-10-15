@@ -602,14 +602,19 @@ def cmd_message_show(args: argparse.Namespace) -> int:
             rows = conn.execute("SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? ORDER BY seq", (group_id,)).fetchall()
         else:
             rows = conn.execute("SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? AND seq<=? ORDER BY seq", (group_id, last_seq)).fetchall()
-        lines = [f"[group:{group_id} topic:{group['topic']}] reconstructed-digest={len(rows)}"]
-        for r in rows:
+        total = len(rows)
+        window = rows[-5:] if total > 5 else rows
+        omitted = total - len(window)
+        lines = [f"[group:{group_id} topic:{group['topic']}] reconstructed-digest={len(window)} of {total}"]
+        for r in window:
             try:
                 text = json.loads(r["payload"]).get("text", "")
             except (json.JSONDecodeError, TypeError):
                 text = str(r["payload"])
             text = text.replace("\\n", " ").replace("\n", " ")[:240]
             lines.append(f"  seq {r['seq']} from {r['sender_agent']}: {text}")
+        if omitted:
+            lines.append(f"  ... +{omitted} more (full: bus group messages --group-id {group_id} --agent-id {args.agent_id})")
         digest = "\n".join(lines)
         conn.close()
         print(json_dumps({"ok": True, "agent_id": args.agent_id, "message": {"message_id": args.message_id, "from_agent": group_id, "to_agent": args.agent_id, "thread_id": group_id, "payload": json.dumps({"text": digest}, ensure_ascii=False), "status": "delivered"}}))
