@@ -581,6 +581,39 @@ def cmd_message_show(args: argparse.Namespace) -> int:
     conn = connect()
     require_auth(conn, args.agent_id)
     row = conn.execute("SELECT * FROM messages WHERE message_id=?", (args.message_id,)).fetchone()
+    if row is None or ((args.message_id or "").startswith("group-digest-") and args.agent_id not in {row["from_agent"], row["to_agent"]}):
+
+        # Synthetic digest ids are shared across recipients, so a persisted
+        # row can only be owned by one agent. Fall back to reconstructing the
+        # digest from the group itself for any active member.
+        syn = args.message_id[len("group-digest-"):]
+        try:
+            group_id, last_seq = syn.rsplit("-", 1)
+            last_seq = int(last_seq)
+        except (ValueError, TypeError):
+            group_id, last_seq = syn, None
+        _group_require_member(conn, group_id, args.agent_id)
+        if conn.execute("SELECT 1 FROM groups WHERE group_id=?", (group_id,)).fetchone() is None:
+            conn.close()
+            raise SystemExit(f"error: unknown group {group_id!r}")
+        group = conn.execute("SELECT topic FROM groups WHERE group_id=?", (group_id,)).fetchone()
+        if last_seq is None:
+            latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (group_id,)).fetchone()["seq"]
+            rows = conn.execute("SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? ORDER BY seq", (group_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? AND seq<=? ORDER BY seq", (group_id, last_seq)).fetchall()
+        lines = [f"[group:{group_id} topic:{group['topic']}] reconstructed-digest={len(rows)}"]
+        for r in rows:
+            try:
+                text = json.loads(r["payload"]).get("text", "")
+            except (json.JSONDecodeError, TypeError):
+                text = str(r["payload"])
+            text = text.replace("\\n", " ").replace("\n", " ")[:240]
+            lines.append(f"  seq {r['seq']} from {r['sender_agent']}: {text}")
+        digest = "\n".join(lines)
+        conn.close()
+        print(json_dumps({"ok": True, "agent_id": args.agent_id, "message": {"message_id": args.message_id, "from_agent": group_id, "to_agent": args.agent_id, "thread_id": group_id, "payload": json.dumps({"text": digest}, ensure_ascii=False), "status": "delivered"}}))
+        return 0
     if row is None:
         conn.close()
         raise SystemExit(f"error: message {args.message_id} not found")
