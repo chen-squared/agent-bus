@@ -1559,7 +1559,7 @@ def cmd_group_join(args: argparse.Namespace) -> int:
             rate_seconds=excluded.rate_seconds,
             joined_at=excluded.joined_at
         """,
-        (args.group_id, args.agent_id, args.role or "member", rate, now_ts, "active"),
+        (args.group_id, args.agent_id, "member", rate, now_ts, "active"),
     )
     conn.execute(
         "INSERT OR IGNORE INTO group_read_state (group_id,agent_id,last_read_seq,updated_at) VALUES (?,?,?,?)",
@@ -1577,6 +1577,24 @@ def cmd_group_leave(args: argparse.Namespace) -> int:
     conn.execute("DELETE FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id))
     conn.commit()
     print(json_dumps({"ok": True, "group_id": args.group_id, "agent_id": args.agent_id, "status": "left"}))
+    conn.close()
+    return 0
+
+def cmd_group_close(args: argparse.Namespace) -> int:
+    conn = connect()
+    require_auth(conn, args.agent_id)
+    if conn.execute("SELECT 1 FROM groups WHERE group_id=?", (args.group_id,)).fetchone() is None:
+        conn.close()
+        raise SystemExit(f"error: unknown group {args.group_id}")
+    member = conn.execute("SELECT role FROM group_members WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id)).fetchone()
+    if member is None or member["role"] not in {"owner", "admin"}:
+        group = conn.execute("SELECT created_by FROM groups WHERE group_id=?", (args.group_id,)).fetchone()
+        if group is None or group["created_by"] != args.agent_id:
+            conn.close()
+            raise SystemExit("error: group close requires owner or admin")
+    conn.execute("UPDATE groups SET status='closed', updated_at=? WHERE group_id=?", (now(), args.group_id))
+    conn.commit()
+    print(json_dumps({"ok": True, "group_id": args.group_id, "status": "closed"}))
     conn.close()
     return 0
 
@@ -2036,6 +2054,10 @@ def main() -> int:
     gl.add_argument("--group-id", required=True)
     gl.add_argument("--agent-id", required=True)
     gl.set_defaults(func=cmd_group_leave)
+    gc = g.add_parser("close", help="close group (owner only)")
+    gc.add_argument("--group-id", required=True)
+    gc.add_argument("--agent-id", required=True)
+    gc.set_defaults(func=cmd_group_close)
     glist = g.add_parser("list", help="list groups")
     glist.add_argument("--agent-id")
     glist.set_defaults(func=cmd_group_list)

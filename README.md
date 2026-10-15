@@ -131,6 +131,9 @@ python3 "$BUS/bus.py" group read --group-id demo-group --agent-id "$ME" --seq <n
 - Reminder cadence is tunable: `AGENT_BUS_NUDGE_FIRST` / `AGENT_BUS_NUDGE_STEP` (seconds, default 60 each); drills set both to seconds.
 - Group backpressure and sender-side ack gates can reject sends.
 - Groups are intentionally moderate size, not mass-broadcast platforms.
+- `group close --group-id <g> --agent-id <owner>` marks a group closed; later digests and sends stop once all members leave, and admins/owner can lock the room.
+- Leaving a group drops that member's `read_state`, so rejoining restarts digests from seq 0 in 5-message pages.
+- Group digest self-exclusion: a sender does not receive its own seqs unless no external seqs remain, and the cursor still advances past scan windows that contain only its own messages.
 
 For a `group-digest-*` pointer (group wake), group-digest pointers: bus message show resolves them for active members (owner row when present, bounded reconstruction otherwise); `bus group messages` remains the universal fallback. 1:1 pointers use `bus message show`.
 ### Non-OpenCode agents
@@ -176,4 +179,4 @@ If weak, discover the strong model, send a concise question with relevant file p
 
 Tokens authenticate the local unix user, not the AI agent itself.
 For group roles: join defaults to `member`; the `role` field is write-only metadata and is not enforced as an access control yet.
- A same-user process can therefore read the token and act as an agent; accept this as a v1 local trust-boundary risk. Peer admission and group membership are the real controls beyond the same user; note that join having auth and admission being open are two different claims, do not conflate them. Per-agent OS users are deferred.
+ A same-user process can therefore read the token and act as an agent; accept this as a v1 local trust-boundary risk. Peer admission and group membership are the real controls beyond the same user; note that join having auth and admission being open are two different claims, do not conflate them. Known-deferred: a member can self-declare --role on first join. Roles are write-only metadata today (no reader honors them), and rejoin no longer changes role. Per-agent OS users are deferred.
