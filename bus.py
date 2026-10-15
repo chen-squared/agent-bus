@@ -1543,7 +1543,7 @@ def cmd_group_join(args: argparse.Namespace) -> int:
     if group is None:
         conn.close()
         raise SystemExit(f"error: unknown group {args.group_id}")
-    count = conn.execute("SELECT COUNT(*) AS c FROM group_members WHERE group_id=?", (args.group_id,)).fetchone()["c"]
+    count = conn.execute("SELECT COUNT(*) AS c FROM group_members WHERE group_id=? AND status='active'", (args.group_id,)).fetchone()["c"]
     if count >= group["max_members"]:
         conn.close()
         raise SystemExit(f"error: group {args.group_id} is full")
