@@ -235,23 +235,36 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
         message = {
             "message_id": f"group-digest-{g['group_id']}-{latest}",
             "from_agent": f"{g['group_id']}",
+            # CommandAdapter reads message["to_agent"] for the agent_id
+            # placeholder and for AGENT_BUS_TO_AGENT. Its absence raised
+            # KeyError on every digest, so command-adapter agents received
+            # no group messages at all.
+            "to_agent": agent_id,
             "thread_id": g["group_id"],
             "payload": json.dumps({"text": digest_text}, ensure_ascii=False),
             "attachments": "[]",
             "_attachment_paths": [],
             "_group_id": g["group_id"],
+            "_digest_seq": last,
         }
-        conn.execute(
-            """
-            UPDATE group_read_state
-            SET last_digest_seq=?, updated_at=?
-            WHERE group_id=? AND agent_id=?
-            """,
-            (last, time.time(), g["group_id"], agent_id),
-        )
-        conn.commit()
+        # The cursor is NOT advanced here. Committing it before inject marked
+        # unread messages as digested even when inject raised, which silently
+        # dropped group messages. See commit_group_digest.
         return message
     return None
+
+
+def commit_group_digest(conn: sqlite3.Connection, agent_id: str, message: dict[str, Any]) -> None:
+    """Advance the digest cursor, but only once the adapter accepted the digest."""
+    conn.execute(
+        """
+        UPDATE group_read_state
+        SET last_digest_seq=?, updated_at=?
+        WHERE group_id=? AND agent_id=?
+        """,
+        (message["_digest_seq"], time.time(), message["_group_id"], agent_id),
+    )
+    conn.commit()
 
 
 def main() -> int:
@@ -333,6 +346,7 @@ def main() -> int:
                 if digest_message is not None:
                     try:
                         adapter.inject(digest_message)
+                        commit_group_digest(conn, agent_id, digest_message)
                         log(f"group digest delivered for {digest_message.get('_group_id')}", agent_id)
                     except Exception as exc:
                         log(f"group digest failed: {exc}", agent_id)
