@@ -233,7 +233,7 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
             lines.append(f"  seq {r['seq']} from {r['sender_agent']}: {text}")
         digest_text = "\n".join(lines)
         message = {
-            "message_id": f"group-digest-{g['group_id']}-{latest}",
+            "message_id": f"group-digest-{g['group_id']}-{latest}-{agent_id}",
             "from_agent": f"{g['group_id']}",
             # CommandAdapter reads message["to_agent"] for the agent_id
             # placeholder and for AGENT_BUS_TO_AGENT. Its absence raised
