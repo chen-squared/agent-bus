@@ -1617,10 +1617,27 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
     read_state = conn.execute("SELECT last_read_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.from_agent)).fetchone()
     last_read = read_state["last_read_seq"] if read_state else 0
+    digest_state = conn.execute(
+        "SELECT last_digest_seq FROM group_read_state WHERE group_id=? AND agent_id=?",
+        (args.group_id, args.from_agent),
+    ).fetchone()
+    last_digest = digest_state["last_digest_seq"] if digest_state and digest_state["last_digest_seq"] is not None else 0
     if latest > 0 and last_read < latest:
         conn.close()
         raise SystemExit(
-            json_dumps({"error": "must confirm latest message first", "latest_seq": latest, "last_read_seq": last_read})
+            json_dumps(
+                {
+                    "error": "must confirm latest message first",
+                    "latest_seq": latest,
+                    "last_read_seq": last_read,
+                    "last_digest_seq": last_digest,
+                    "digest_health_hint": (
+                        "caught-up messages may still be unprocessed by your notifier"
+                        if last_digest < latest
+                        else "digest path is healthy, only a manual read catch-up is missing"
+                    ),
+                }
+            )
         )
     if not (args.text or "").strip():
         conn.close()
