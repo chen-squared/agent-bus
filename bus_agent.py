@@ -164,12 +164,6 @@ def materialize_attachments(message: dict[str, Any], conn: sqlite3.Connection) -
 def log(msg: str, agent_id: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{agent_id}] {msg}"
     print(line, flush=True)
-    try:
-        path = Path(f"/Users/chen/Developer/agent-bus/bus_agent_{agent_id}.log")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
 
 
 def agent_row(conn: sqlite3.Connection, agent_id: str) -> sqlite3.Row | None:
@@ -237,7 +231,7 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
             if len(text) > 500:
                 text = text[:500] + "…+" + str(len(text) - 500) + " chars (full: bus group messages --group-id " + g["group_id"] + " --agent-id " + agent_id + ")"
             lines.append(f"  seq {r['seq']} from {r['sender_agent']}: {text}")
-        digest_text = "\\n".join(lines)
+        digest_text = "\n".join(lines)
         message = {
             "message_id": f"group-digest-{g['group_id']}-{latest}",
             "from_agent": f"{g['group_id']}",

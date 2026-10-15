@@ -697,6 +697,9 @@ def cmd_send(args: argparse.Namespace) -> int:
                     "path": str(p.resolve()),
                 }
                 attachments.append(manifest)
+    if not (args.text or "").strip():
+        conn.close()
+        raise SystemExit("error: group message text must not be empty")
     text_bytes = len(args.text.encode("utf-8"))
     if text_bytes > 64 * 1024:
         print("error: message text exceeds 64KB", file=sys.stderr)

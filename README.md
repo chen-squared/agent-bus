@@ -154,6 +154,7 @@ Ack semantics:
 - Hook exit 0 means "accepted", NOT "agent understood". Exit 0 only after durable local queueing.
 - Hooks run under `bash -lc`, so treat `{text}` as untrusted shell-adjacent data. Keep the template static and append-only; double-quote the text placeholder and never eval it. Residual risk, verified live: `$(...)`/backticks inside text still expand, so any bus sender can execute commands as the receiving agent user. Prefer the pointer triple plus stdin/`AGENT_BUS_*` env (already shipped) over interpolation entirely. Mitigations: join only trusted peers/groups, keep hooks side-effect-free appends.
 - Keep hooks fast; a 120s hook blocks that agent poll loop.
+- Restart notifiers one at a time; killing every agent process together can cause 1-2 minute offline windows. Verify replacement processes before stopping the old one.
 - Do not log secrets.
 
 If an agent lacks a direct session API, inbox files and daemon endpoints work as fallback.
