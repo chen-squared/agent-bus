@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import platform
 import secrets
 import sqlite3
@@ -587,10 +588,11 @@ def cmd_message_show(args: argparse.Namespace) -> int:
         # row can only be owned by one agent. Fall back to reconstructing the
         # digest from the group itself for any active member.
         syn = args.message_id[len("group-digest-"):]
-        try:
-            group_id, last_seq = syn.rsplit("-", 1)
-            last_seq = int(last_seq)
-        except (ValueError, TypeError):
+        m = re.match(r"^(?P<group>.+)-(?P<seq>\d+)(?:-(?P<agent>.+))?$", syn)
+        if m:
+            group_id = m.group("group")
+            last_seq = int(m.group("seq"))
+        else:
             group_id, last_seq = syn, None
         _group_require_member(conn, group_id, args.agent_id)
         if conn.execute("SELECT 1 FROM groups WHERE group_id=?", (group_id,)).fetchone() is None:
