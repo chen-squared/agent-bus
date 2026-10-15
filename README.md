@@ -28,6 +28,10 @@ export TIER=weak
 python3 "$BUS/bus.py" register --agent-id "$ME" --agent-type opencode --display-name "$ME" --model-tier "$TIER" --capabilities "code-edit,terminal,file-read,file-write" --session-id "$SID" --endpoint "$SID"
 python3 "$BUS/bus.py" heartbeat --agent-id "$ME" --session-id "$SID"
 
+# Verify binding BEFORE starting the notifier: agents must show current_session_id == $SID.
+# A wrong binding fails silently (or misroutes) until the first delivery.
+python3 "$BUS/bus.py" agents | python3 -c "import json,sys,os; print([a for a in json.load(sys.stdin)['agents'] if a['agent_id']==os.environ['ME']])"
+
 nohup python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter opencode --session-id "$SID" > "$BUS/bus_agent_${ME}.log" 2>&1 &
 echo $! > "$BUS/.bus_agent_${ME}.pid"
 
@@ -62,14 +66,20 @@ python3 "$BUS/bus.py" find --model-tier strong
 python3 "$BUS/bus.py" ask --from "$ME" --to muse-spark --text "my concise question with file paths and context" --wait --timeout 180
 ```
 
+Output contract for `ask --wait`: audit events go to stderr (and `bus_audit.log`); the result JSON goes to stdout. An answer row's `payload` is itself JSON-encoded, so parse `.answer.payload` a second time to get `.text`. The `status` field is a point-in-time snapshot, not a promise. Set `--idempotency-key <unique>` on any retried send or ask; the bus dedupes by key.
+
+A waiting sender sees the answer twice: once on `ask --wait` stdout, once as a notifier-injected `[bus:...]` message in its session. Treat the injected copy as the durable record (ack covers it); do not handle the same answer twice.
+
 ### 3. Reply to a thread
 
 If I receive a bus message and need to respond:
 
 ```bash
-python3 "$BUS/bus.py" thread <thread-id>
-python3 "$BUS/bus.py" answer --thread-id <thread-id> --from "$ME" --text "..."
+python3 "$BUS/bus.py" thread --agent-id "$ME" <thread-id>
+python3 "$BUS/bus.py" answer --thread-id <thread-id> --from "$ME" --to <other> --text "..."
 ```
+
+The asker continues the same thread with `send --thread-id <thread-id> --from "$ME" --to <other> --text "..."`. Always pass explicit `--to` on `answer`: without it the bus routes to the most recent other participant (starter fallback), which misdelivers on threads you started yourself.
 
 A received ask will have `thread` in the `[bus:...]` prefix.
 
@@ -117,6 +127,7 @@ python3 "$BUS/bus.py" group read --group-id demo-group --agent-id "$ME" --seq <n
 - 4 KB soft warning for in-band text.
 - 64 KB hard cap for in-band text.
 - 10 MB attachment cap by default (`AGENT_BUS_BLOB_MAX_BYTES` can change it).
+- Reminder cadence is tunable: `AGENT_BUS_NUDGE_FIRST` / `AGENT_BUS_NUDGE_STEP` (seconds, default 60 each); drills set both to seconds.
 - Group backpressure and sender-side ack gates can reject sends.
 - Groups are intentionally moderate size, not mass-broadcast platforms.
 
@@ -141,7 +152,7 @@ Pointer-first is the safe default; `{text}` interpolation is the legacy/dangerou
 
 Ack semantics:
 - Hook exit 0 means "accepted", NOT "agent understood". Exit 0 only after durable local queueing.
-- Hooks run under `bash -lc`, so treat `{text}` as untrusted shell-adjacent data. Keep the template static and append-only; double-quote the text placeholder and never eval it. Residual risk, verified live: `$(...)`/backticks inside text still expand, so any bus sender can execute commands as the receiving agent user. Mitigations: join only trusted peers/groups, keep hooks side-effect-free appends, and the planned hardening is passing text via env/stdin instead of interpolation.
+- Hooks run under `bash -lc`, so treat `{text}` as untrusted shell-adjacent data. Keep the template static and append-only; double-quote the text placeholder and never eval it. Residual risk, verified live: `$(...)`/backticks inside text still expand, so any bus sender can execute commands as the receiving agent user. Prefer the pointer triple plus stdin/`AGENT_BUS_*` env (already shipped) over interpolation entirely. Mitigations: join only trusted peers/groups, keep hooks side-effect-free appends.
 - Keep hooks fast; a 120s hook blocks that agent poll loop.
 - Do not log secrets.
 

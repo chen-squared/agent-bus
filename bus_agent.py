@@ -226,13 +226,16 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
             "SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? AND seq>=? AND seq<=? ORDER BY seq",
             (g["group_id"], first, last),
         ).fetchall()
-        lines = [f"[group:{g['group_id']} topic:{g['topic']}] seq={first}-{latest} digest={len(rows)} of {latest - g['last_digest_seq']} unread"]
+        pending = latest - g["last_digest_seq"]
+        lines = [f"[group:{g['group_id']} topic:{g['topic']}] seq={first}-{last} digest={len(rows)} of {pending} unread"]
         for r in rows:
             try:
                 text = json.loads(r["payload"]).get("text", "")
             except (json.JSONDecodeError, TypeError):
                 text = str(r["payload"])
-            text = text.replace("\\n", " ")[:160]
+            text = text.replace("\\n", " ").replace("\n", " ")
+            if len(text) > 500:
+                text = text[:500] + "…+" + str(len(text) - 500) + " chars (full: bus group messages --group-id " + g["group_id"] + " --agent-id " + agent_id + ")"
             lines.append(f"  seq {r['seq']} from {r['sender_agent']}: {text}")
         digest_text = "\\n".join(lines)
         message = {
@@ -250,7 +253,7 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
             SET last_digest_seq=?, updated_at=?
             WHERE group_id=? AND agent_id=?
             """,
-            (latest, time.time(), g["group_id"], agent_id),
+            (last, time.time(), g["group_id"], agent_id),
         )
         conn.commit()
         return message
