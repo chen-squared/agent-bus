@@ -215,14 +215,42 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
         if latest <= g["last_digest_seq"]:
             continue
         first = g["last_digest_seq"] + 1
-        last = min(g["last_digest_seq"] + 5, latest)
+        # Scan wider than the render budget. Own messages are skipped below, and
+        # if the window were only as wide as the budget a burst of my own posts
+        # would hold it open and starve everyone else's messages out of view.
+        scan_to = min(g["last_digest_seq"] + 40, latest)
         rows = conn.execute(
             "SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? AND seq>=? AND seq<=? ORDER BY seq",
-            (g["group_id"], first, last),
+            (g["group_id"], first, scan_to),
         ).fetchall()
-        pending = latest - g["last_digest_seq"]
-        lines = [f"[group:{g['group_id']} topic:{g['topic']}] seq={first}-{last} digest={len(rows)} of {pending} unread"]
-        for r in rows:
+        # My own posts are already in my context, so digesting them back to me is
+        # a wake for nothing.
+        foreign = [r for r in rows if r["sender_agent"] != agent_id]
+        if not foreign:
+            # Nothing to say to me, but the cursor still has to slide or the
+            # window never moves past my own messages. Advancing here is safe:
+            # the no-advance-before-inject invariant protects a render that could
+            # fail, and there is nothing to render.
+            conn.execute(
+                """
+                INSERT INTO group_read_state (group_id,agent_id,last_digest_seq,updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(group_id,agent_id) DO UPDATE SET
+                    last_digest_seq=excluded.last_digest_seq,
+                    updated_at=excluded.updated_at
+                """,
+                (g["group_id"], agent_id, scan_to, time.time()),
+            )
+            conn.commit()
+            continue
+        take = foreign[:5]
+        last = take[-1]["seq"]
+        pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND seq>? AND seq<=? AND sender_agent<>?",
+            (g["group_id"], g["last_digest_seq"], latest, agent_id),
+        ).fetchone()["c"]
+        lines = [f"[group:{g['group_id']} topic:{g['topic']}] seq={first}-{scan_to} digest={len(take)} of {pending} unread (own posts not shown)"]
+        for r in take:
             try:
                 text = json.loads(r["payload"]).get("text", "")
             except (json.JSONDecodeError, TypeError):
@@ -233,7 +261,12 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
             lines.append(f"  seq {r['seq']} from {r['sender_agent']}: {text}")
         digest_text = "\n".join(lines)
         message = {
-            "message_id": f"group-digest-{g['group_id']}-{latest}-{agent_id}",
+            # Keyed on the last seq actually rendered, not on latest. Two digest
+            # rounds inside the same latest window would otherwise collide on
+            # this id, and commit_group_digest's INSERT OR IGNORE silently drops
+            # the second row: the text still reaches the adapter, but
+            # `bus message show` on that pointer returns not found.
+            "message_id": f"group-digest-{g['group_id']}-{last}-{agent_id}",
             "from_agent": f"{g['group_id']}",
             # CommandAdapter reads message["to_agent"] for the agent_id
             # placeholder and for AGENT_BUS_TO_AGENT. Its absence raised

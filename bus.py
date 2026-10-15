@@ -1582,6 +1582,10 @@ def cmd_group_join(args: argparse.Namespace) -> int:
 
 def cmd_group_leave(args: argparse.Namespace) -> int:
     conn = connect()
+    # Without this any same-user agent could leave on someone else's behalf,
+    # which deletes that member's read_state row and resets their digest cursor
+    # to zero -- more destructive than an unauthenticated join.
+    require_auth(conn, args.agent_id)
     conn.execute("UPDATE group_members SET status='left' WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id))
     conn.execute("DELETE FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id))
     conn.commit()
