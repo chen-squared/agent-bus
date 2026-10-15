@@ -258,6 +258,7 @@ def commit_group_digest(conn: sqlite3.Connection, agent_id: str, message: dict[s
     """Advance the digest cursor, but only once the adapter accepted the digest."""
     now_ts = time.time()
     payload = json.loads(message["payload"])
+    bus.ensure_thread(conn, message["thread_id"], agent_id, [agent_id])
     conn.execute(
         """
         INSERT OR IGNORE INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,
