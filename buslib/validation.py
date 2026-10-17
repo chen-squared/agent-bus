@@ -39,3 +39,13 @@ def nonneg_float(value: str) -> float:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be >= 0")
     return parsed
+
+
+__all__ = [
+    "ID_RE",
+    "SHA256_RE",
+    "nonneg_float",
+    "nonneg_int",
+    "validate_id",
+    "validate_sha256",
+]

@@ -274,3 +274,17 @@ def cmd_init(_args: argparse.Namespace) -> int:
     print(json_dumps({"ok": True, "db": str(db_path()), "path": str(db_path())}))
     conn.close()
     return 0
+
+
+__all__ = [
+    "cmd_init",
+    "connect",
+    "db_path",
+    "find_duplicate_message",
+    "init_schema",
+    "require_agent",
+    "require_auth",
+    "require_operator_auth",
+    "scoped_idempotency_key",
+    "tx",
+]

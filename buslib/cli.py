@@ -290,3 +290,9 @@ def main() -> int:
     # handler connects anyway, so this just ran the whole schema migration
     # twice per invocation.)
     return args.func(args)
+
+
+__all__ = [
+    "BusArgumentParser",
+    "main",
+]

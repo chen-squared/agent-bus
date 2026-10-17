@@ -615,3 +615,17 @@ def cmd_answer(args: argparse.Namespace) -> int:
     print(json_dumps(result))
     conn.close()
     return 0
+
+
+__all__ = [
+    "cmd_ack",
+    "cmd_answer",
+    "cmd_ask",
+    "cmd_inbox",
+    "cmd_message_show",
+    "cmd_send",
+    "cmd_thread",
+    "ensure_thread",
+    "fetch_inbox",
+    "parse_group_digest_id",
+]

@@ -129,3 +129,25 @@ def public_agent(item: dict[str, Any]) -> dict[str, Any]:
     with no auth. token_hash must never ride along."""
     item.pop("token_hash", None)
     return item
+
+
+__all__ = [
+    "AUDIT_LOG",
+    "BUS_HOME",
+    "DEFAULT_DB",
+    "NUDGE_FIRST_SECONDS",
+    "NUDGE_STEP_SECONDS",
+    "TOKEN_DIR",
+    "audit_log",
+    "chmod_private",
+    "json_dumps",
+    "load_token",
+    "machine_id",
+    "now",
+    "parse_capabilities",
+    "public_agent",
+    "row_to_dict",
+    "save_token",
+    "sha256_text",
+    "token_path",
+]

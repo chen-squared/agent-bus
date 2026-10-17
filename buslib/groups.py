@@ -494,3 +494,16 @@ def cmd_group_status(args: argparse.Namespace) -> int:
     )
     conn.close()
     return 0
+
+
+__all__ = [
+    "cmd_group_close",
+    "cmd_group_create",
+    "cmd_group_join",
+    "cmd_group_leave",
+    "cmd_group_list",
+    "cmd_group_messages",
+    "cmd_group_read",
+    "cmd_group_send",
+    "cmd_group_status",
+]

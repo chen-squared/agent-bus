@@ -252,3 +252,15 @@ def cmd_outbox_flush(args: argparse.Namespace) -> int:
     print(json_dumps({"ok": True, "flushed": flushed, "failed": failed, "given_up": given_up}))
     conn.close()
     return 0 if failed == 0 else 1
+
+
+__all__ = [
+    "cmd_outbox_flush",
+    "cmd_outbox_list",
+    "cmd_peer_add",
+    "cmd_peer_list",
+    "cmd_peer_remove",
+    "cmd_status",
+    "mask_peer",
+    "sweep_outbox",
+]

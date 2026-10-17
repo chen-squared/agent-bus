@@ -272,3 +272,14 @@ def sweep_nudges(conn: sqlite3.Connection) -> tuple[int, int]:
                 )
             stale += 1
     return nudges, stale
+
+
+__all__ = [
+    "cmd_dlq_discard",
+    "cmd_dlq_list",
+    "cmd_dlq_retry",
+    "cmd_prune",
+    "cmd_sweep",
+    "sweep_expired",
+    "sweep_nudges",
+]

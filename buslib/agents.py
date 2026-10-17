@@ -329,3 +329,19 @@ def cmd_find(args: argparse.Namespace) -> int:
 
 
 OPENCODE_CLI = resolve_opencode_cli()
+
+
+__all__ = [
+    "HEARTBEAT_EXPIRY",
+    "OPENCODE_CLI",
+    "capabilities_info",
+    "cmd_agents",
+    "cmd_capabilities",
+    "cmd_find",
+    "cmd_heartbeat",
+    "cmd_liveness",
+    "cmd_register",
+    "is_stale",
+    "resolve_opencode_cli",
+    "sweep_agents",
+]

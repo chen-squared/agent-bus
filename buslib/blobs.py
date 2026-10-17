@@ -213,3 +213,19 @@ def cmd_blob_gc(args: argparse.Namespace) -> int:
         p.unlink(missing_ok=True)
         removed += 1
     print(json_dumps({"ok": True, "removed": removed, "removed_bytes": removed_bytes, "kept": kept}))
+
+
+__all__ = [
+    "blob_dir",
+    "blob_materialize",
+    "blob_max_bytes",
+    "blob_path",
+    "cmd_blob_gc",
+    "cmd_blob_get",
+    "cmd_blob_list",
+    "cmd_blob_put",
+    "iter_referenced_blob_hashes",
+    "prepare_attachments",
+    "sha256_file",
+    "store_blob_from_path",
+]
