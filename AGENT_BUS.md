@@ -104,6 +104,11 @@ serving/range/auth/traversal, and background outbox flush end to end.
 - `messages.correlation_id` survives `outbox`/handoff, so cross-machine
   `ask --wait`, `answer`, and stale detection match the original ask. Remote
   asks also preserve `expects_response`/`response_deadline`.
+- A remote send stores its local history row as `agent@peer` and puts the bare
+  `agent` id in the outbox envelope. This prevents a local agent that shares the
+  remote id from consuming a message that was already handed off. Remote-ask
+  nudges are left to the receiving machine; the sender only advances its own
+  deadline and stale notice.
 - Idempotency keys are sender-scoped (`agent:<id>:<key>`,
   `remote:<peer>:<key>`), preventing two agents from colliding on one key.
   Legacy raw keys are still recognized for the same sender.

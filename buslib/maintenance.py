@@ -206,39 +206,43 @@ def sweep_nudges(conn: sqlite3.Connection) -> tuple[int, int]:
                     f"bus answer --thread-id {ask['thread_id']} --from {ask['to_agent']} --text '...'. "
                     f"Otherwise reply now."
                 )
-                # system message to recipient
-                system_id = str(uuid.uuid4())
-                conn.execute(
-                    """
-                    INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
-                        payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,status,created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        system_id,
-                        ask["thread_id"],
-                        None,
-                        "system",
-                        ask["to_agent"],
-                        "system",
-                        "normal",
-                        json_dumps({"text": reminder_text}),
-                        "[]",
-                        86400,
-                        ts + 86400,
-                        0,
-                        None,
-                        0,
-                        "queued",
-                        ts,
-                    ),
-                )
+                # The sender's row for a remote ask is namespaced
+                # (`agent@peer`), and no local notifier can consume a reminder
+                # addressed to it. The remote machine has its own ask row and
+                # nudge path; only advance the local cursor here.
+                if "@" not in str(ask["to_agent"]):
+                    system_id = str(uuid.uuid4())
+                    conn.execute(
+                        """
+                        INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
+                            payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,status,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            system_id,
+                            ask["thread_id"],
+                            None,
+                            "system",
+                            ask["to_agent"],
+                            "system",
+                            "normal",
+                            json_dumps({"text": reminder_text}),
+                            "[]",
+                            86400,
+                            ts + 86400,
+                            0,
+                            None,
+                            0,
+                            "queued",
+                            ts,
+                        ),
+                    )
+                    nudges += 1
                 await_nudge_backoff = NUDGE_STEP_SECONDS
                 conn.execute(
                     "UPDATE messages SET nudge_count=?, response_deadline=? WHERE message_id=?",
                     (ncount + 1, ts + await_nudge_backoff, ask["message_id"]),
                 )
-                nudges += 1
             else:
                 notice_id = str(uuid.uuid4())
                 conn.execute(

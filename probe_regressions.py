@@ -149,8 +149,13 @@ check("local ask --wait sees the answer", local.returncode == 0 and "local answe
 
 cli("peer", "add", "--peer", "remote", "--base-url", "http://127.0.0.1:9", "--token", "x", "--agent-id", "alice")
 remote = run_ask_wait("wait-remote", "bob@remote")
-ask_row = wait_row(conn, "SELECT message_id FROM messages WHERE thread_id='wait-remote' AND message_type='ask'", ())
+ask_row = wait_row(conn, "SELECT message_id,to_agent FROM messages WHERE thread_id='wait-remote' AND message_type='ask'", ())
+check("remote ask is not stored as a local deliverable row",
+      ask_row is not None and ask_row["to_agent"] == "bob@remote", str(dict(ask_row)) if ask_row else "missing")
 if ask_row:
+    outbox_row = conn.execute("SELECT payload FROM outbox WHERE thread_id='wait-remote'").fetchone()
+    envelope = json.loads(outbox_row["payload"]) if outbox_row else {}
+    check("outbox envelope carries the bare remote id", envelope.get("to_agent") == "bob", str(envelope.get("to_agent")))
     now = time.time()
     conn.execute(
         """INSERT INTO messages (message_id,thread_id,from_agent,to_agent,message_type,urgency,payload,attachments,

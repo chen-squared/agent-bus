@@ -206,29 +206,33 @@ def _insert_message(
 
 def _enqueue_outbox(
     conn: sqlite3.Connection, *, remote_peer: str, message_id: str,
-    from_agent: str, to_agent: str, thread_id: str,
+    from_agent: str, to_agent: str, to_remote: str, thread_id: str,
 ) -> str:
     outbox_id = str(uuid.uuid4())
     row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
+    envelope_message = row_to_dict(row)
+    # The local row addresses the remote agent as `agent@peer` so a local
+    # notifier can never consume it; the peer envelope carries the bare id.
+    envelope_message["to_agent"] = to_remote
     conn.execute(
         """
         INSERT INTO outbox (outbox_id,peer_name,message_id,from_agent,to_remote,thread_id,payload,status,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)
         """,
         (
-            outbox_id, remote_peer, message_id, from_agent, to_agent, thread_id,
-            json_dumps(row_to_dict(row)), "pending", now(), now(),
+            outbox_id, remote_peer, message_id, from_agent, to_remote, thread_id,
+            json_dumps(envelope_message), "pending", now(), now(),
         ),
     )
     return outbox_id
 
 
 def _handoff_outbox_now(
-    conn: sqlite3.Connection, *, outbox_id: str, remote_peer: str, message_id: str
+    conn: sqlite3.Connection, *, outbox_id: str, remote_peer: str
 ) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
+    outbox = conn.execute("SELECT payload FROM outbox WHERE outbox_id=?", (outbox_id,)).fetchone()
     peer = conn.execute("SELECT * FROM peers WHERE peer_name=?", (remote_peer,)).fetchone()
-    ok, receipt = _handoff_peer(row_to_dict(peer), row_to_dict(row), timeout=10)
+    ok, receipt = _handoff_peer(row_to_dict(peer), json.loads(outbox["payload"]), timeout=10)
     conn.execute(
         "UPDATE outbox SET status=?, receipt=?, attempts=attempts+1, last_error=?, updated_at=?, delivered_at=? WHERE outbox_id=?",
         ("sent" if ok else "failed", receipt, None if ok else str(receipt)[:500], now(), now() if ok else None, outbox_id),
@@ -263,7 +267,11 @@ def cmd_send(args: argparse.Namespace) -> int:
     expires = now_ts + ttl if ttl is not None else None
     thread_id = args.thread_id or str(uuid.uuid4())
     validate_id("thread_id", args.thread_id)
-    ensure_thread(conn, thread_id, args.from_agent, [args.from_agent, args.to_agent])
+    # Keep the local history row namespaced for remote targets. Otherwise a
+    # local agent that happens to share the remote id would match fetch_inbox
+    # and receive a message that was already handed off.
+    message_to = f"{args.to_agent}@{remote_peer}" if remote_peer else args.to_agent
+    ensure_thread(conn, thread_id, args.from_agent, [args.from_agent, message_to])
     attachments = prepare_attachments(args.attachment, remote_peer is not None)
     text_bytes = len(args.text.encode("utf-8"))
     if text_bytes > 64 * 1024:
@@ -291,7 +299,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                 thread_id=thread_id,
                 idempotency_key=scoped_idempotency_key(args.from_agent, args.idempotency_key),
                 from_agent=args.from_agent,
-                to_agent=args.to_agent,
+                to_agent=message_to,
                 message_type=message_type,
                 urgency=args.urgency or "normal",
                 payload=payload,
@@ -303,7 +311,8 @@ def cmd_send(args: argparse.Namespace) -> int:
             if remote_peer is not None:
                 outbox_id = _enqueue_outbox(
                     conn, remote_peer=remote_peer, message_id=message_id,
-                    from_agent=args.from_agent, to_agent=args.to_agent, thread_id=thread_id,
+                    from_agent=args.from_agent, to_agent=message_to,
+                    to_remote=args.to_agent, thread_id=thread_id,
                 )
     except sqlite3.IntegrityError as exc:
         conn.close()
@@ -313,7 +322,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     remote_result = None
     if remote_peer is not None and outbox_id is not None:
         remote_result = _handoff_outbox_now(
-            conn, outbox_id=outbox_id, remote_peer=remote_peer, message_id=message_id
+            conn, outbox_id=outbox_id, remote_peer=remote_peer
         )
     result = {"ok": True, "message_id": message_id, "thread_id": thread_id, "to": args.to_agent, "type": message_type, "target_stale": target_stale}
     if soft_warning:
@@ -395,7 +404,11 @@ def cmd_ask(args: argparse.Namespace) -> int:
     now_ts = now()
     thread_id = args.thread_id or str(uuid.uuid4())
     validate_id("thread_id", args.thread_id)
-    ensure_thread(conn, thread_id, args.from_agent, [args.from_agent, args.to_agent])
+    # Keep the local history row namespaced for remote targets. Otherwise a
+    # local agent that happens to share the remote id would match fetch_inbox
+    # and receive a message that was already handed off.
+    message_to = f"{args.to_agent}@{remote_peer}" if remote_peer else args.to_agent
+    ensure_thread(conn, thread_id, args.from_agent, [args.from_agent, message_to])
     attachments = prepare_attachments(args.attachment, remote_peer is not None)
     text_bytes = len(args.text.encode("utf-8"))
     if text_bytes > 64 * 1024:
@@ -425,7 +438,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
                 thread_id=thread_id,
                 idempotency_key=scoped_idempotency_key(args.from_agent, args.idempotency_key),
                 from_agent=args.from_agent,
-                to_agent=args.to_agent,
+                to_agent=message_to,
                 message_type="ask",
                 urgency=args.urgency or "normal",
                 payload=payload,
@@ -440,7 +453,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
             if remote_peer is not None:
                 outbox_id = _enqueue_outbox(
                     conn, remote_peer=remote_peer, message_id=message_id,
-                    from_agent=args.from_agent, to_agent=args.to_agent, thread_id=thread_id,
+                    from_agent=args.from_agent, to_agent=message_to,
+                    to_remote=args.to_agent, thread_id=thread_id,
                 )
     except sqlite3.IntegrityError as exc:
         conn.close()
@@ -450,7 +464,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
     remote_result = None
     if remote_peer is not None and outbox_id is not None:
         remote_result = _handoff_outbox_now(
-            conn, outbox_id=outbox_id, remote_peer=remote_peer, message_id=message_id
+            conn, outbox_id=outbox_id, remote_peer=remote_peer
         )
     result = {"ok": True, "message_id": message_id, "thread_id": thread_id, "to": args.to_agent, "type": "ask"}
     if soft_warning:
@@ -545,6 +559,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
     else:
         validate_id("agent_id", to)
         require_agent(conn, to)
+    message_to = f"{to}@{remote_peer}" if remote_peer else to
     now_ts = now()
     ttl = args.ttl if args.ttl is not None else 300
     expires = now_ts + ttl
@@ -584,7 +599,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
                 thread_id=args.thread_id,
                 idempotency_key=scoped_idempotency_key(args.from_agent, args.idempotency_key),
                 from_agent=args.from_agent,
-                to_agent=to,
+                to_agent=message_to,
                 message_type="answer",
                 urgency=args.urgency or "normal",
                 payload=payload,
@@ -598,7 +613,8 @@ def cmd_answer(args: argparse.Namespace) -> int:
             if remote_peer is not None:
                 outbox_id = _enqueue_outbox(
                     conn, remote_peer=remote_peer, message_id=message_id,
-                    from_agent=args.from_agent, to_agent=to, thread_id=args.thread_id,
+                    from_agent=args.from_agent, to_agent=message_to,
+                    to_remote=to, thread_id=args.thread_id,
                 )
     except sqlite3.IntegrityError as exc:
         conn.close()
@@ -608,7 +624,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
     remote_result = None
     if remote_peer is not None and outbox_id is not None:
         remote_result = _handoff_outbox_now(
-            conn, outbox_id=outbox_id, remote_peer=remote_peer, message_id=message_id
+            conn, outbox_id=outbox_id, remote_peer=remote_peer
         )
     result = {"ok": True, "message_id": message_id, "thread_id": args.thread_id, "to": to, "type": "answer"}
     if remote_result:
