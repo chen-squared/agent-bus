@@ -139,7 +139,7 @@ def main() -> int:
         # SystemExit is not caught by `except Exception`, so an unguarded ack
         # used to kill the whole notifier process.
         try:
-            cmd_ack(argparse.Namespace(agent_id=agent_id, message_id=message_id))
+            cmd_ack(argparse.Namespace(agent_id=agent_id, message_id=message_id, quiet=True))
         except SystemExit as exc:
             log(f"ack failed for {message_id}: {exc}", agent_id)
 
@@ -154,7 +154,7 @@ def main() -> int:
                 # clobber a fresh `register --session-id` forever after.
                 hb_session = session_id if explicit_session else None
                 cmd_heartbeat(
-                    argparse.Namespace(agent_id=agent_id, session_id=hb_session, endpoint=hb_session)
+                    argparse.Namespace(agent_id=agent_id, session_id=hb_session, endpoint=hb_session, quiet=True)
                 )
                 last_heartbeat = time.time()
             # Sweeps write; running them on every 1s poll made every notifier

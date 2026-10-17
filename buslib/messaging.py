@@ -371,7 +371,8 @@ def cmd_ack(args: argparse.Namespace) -> int:
         (now(), now(), args.message_id),
     )
     conn.commit()
-    print(json_dumps({"ok": True, "message_id": args.message_id, "acked_at": now()}))
+    if not getattr(args, "quiet", False):
+        print(json_dumps({"ok": True, "message_id": args.message_id, "acked_at": now()}))
     conn.close()
     return 0
 

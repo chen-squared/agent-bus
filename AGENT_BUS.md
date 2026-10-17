@@ -351,7 +351,9 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
   `agent_type=opencode` only; every other adapter returns `unknown` with
   `liveness_source:"none"`, because the bus sees only the adapter's exit code. The
   adapter-agnostic fields (`last_spoke_age_seconds`, `open_asks`) are the honest
-  signal for `command` and `tmux`.
+  signal for `command` and `tmux`. For opencode, `time_idle_at_ms` is the
+  absolute timestamp reported by `time.idle` and `idle_for_ms` is its age;
+  notifier heartbeats remain process liveness, not model liveness.
 - Multi-machine group increment 2 choose SSH restricted forced command;
   see `bus_ssh_gateway.py`, which pins sender identity and allowlists
   group commands only.

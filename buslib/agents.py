@@ -8,6 +8,7 @@ import os
 import secrets
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -130,7 +131,8 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
     params.append(args.agent_id)
     conn.execute(sql, params)
     conn.commit()
-    print(json_dumps({"ok": True, "agent_id": args.agent_id, "heartbeat": updates["last_heartbeat"]}))
+    if not getattr(args, "quiet", False):
+        print(json_dumps({"ok": True, "agent_id": args.agent_id, "heartbeat": updates["last_heartbeat"]}))
     conn.close()
     return 0
 
@@ -190,7 +192,9 @@ def _opencode_outcome(session_id: str) -> dict[str, Any]:
         return {"probe_error": "session.get returned non-JSON"}
     return {
         "outcome": data.get("outcome"),
-        "time_idle_ms": (data.get("time") or {}).get("idle"),
+        # opencode's time.idle is an absolute epoch-ms timestamp, not a
+        # duration. Name it honestly and derive the age below.
+        "time_idle_at_ms": (data.get("time") or {}).get("idle"),
         "turn_model": (data.get("model") or {}).get("id"),
     }
 
@@ -240,9 +244,12 @@ def cmd_liveness(args: argparse.Namespace) -> int:
         out["liveness_source"] = "opencode session.get outcome (opencode's semantics, not the bus's)"
         if probe.get("probe_error"):
             out["probe_error"] = probe["probe_error"]
-        for k in ("time_idle_ms", "turn_model"):
+        for k in ("time_idle_at_ms", "turn_model"):
             if probe.get(k) is not None:
                 out[k] = probe[k]
+        idle_at = probe.get("time_idle_at_ms")
+        if idle_at is not None:
+            out["idle_for_ms"] = max(0, int(time.time() * 1000) - int(idle_at))
     else:
         out["model_liveness"] = "unknown"
         out["liveness_source"] = "none"
