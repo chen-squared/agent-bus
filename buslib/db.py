@@ -245,7 +245,7 @@ def tx(conn: sqlite3.Connection):
 def require_agent(conn: sqlite3.Connection, agent_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
     if row is None:
-        raise SystemExit(f"error: unknown agent {agent_id!r}; run `bus register` first")
+        raise SystemExit(f"error: unknown agent {agent_id!r}; run `agent-bus register` first")
     return row
 
 

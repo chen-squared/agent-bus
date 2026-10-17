@@ -65,6 +65,8 @@ def main() -> int:
             check(f"alice group send {i}", alice.group_send("api-group", f"g{i}").get("ok") is True)
         caught = bob.group_catch_up("api-group")
         check("catch-up drains the group", caught.get("messages_read") == 3 and caught.get("last_read_seq") == 3, str(caught))
+        hist = bob.group_history("api-group")
+        check("group history is available", hist.get("count") == 3 and [m.get("seq") for m in hist.get("messages", [])] == [1, 2, 3], str(hist)[:240])
         check("bob sends after catch-up", bob.group_send("api-group", "caught up").get("ok") is True)
 
         print("D stop")

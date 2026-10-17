@@ -134,7 +134,7 @@ serving/range/auth/traversal, and background outbox flush end to end.
 `up`, delivery through the command adapter, and `down`. `probe_api.py` does the
 same lifecycle through `from buslib import Bus`. `probe_session_verify.py`
 covers strict and warning-only opencode session probes. `probe_group_catch_up.py`
-covers multi-page catch-up and the read gate.
+covers multi-page catch-up, stored history, and the read gate.
 
 - Daemon handoff applies the same id charset validation as the CLI to the
   claimed sender, `to_agent`, and `thread_id`; a remote peer can no longer
@@ -390,7 +390,8 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
 - Sender-side acknowledge gate keys on `group_read_state.last_read_seq`, which the
   notifier digest never advances; recovery is
   `group catch-up --group-id <g> --agent-id <me>` (or manual
-  `group messages` + `group read --seq <latest_seq>`).
+  `group messages` + `group read --seq <latest_seq>`). `group history` is the
+  member-only audit view of stored rows; it does not move any cursor.
 - Three cursors, never writing each other: `last_read_seq` (self-reported, gates
   sends), `last_digest_seq` (notifier render watermark), `last_served_seq` (highest
   seq `group messages` actually returned). `group messages` pages oldest-first under
@@ -402,7 +403,10 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
   `must confirm latest message first`, `rate limited`, `group ceiling reached`,
   `group backpressure: too many unread participants`.
 - Notifier digest: one digest per unseen watermark.
-- CLI: `group create/join/leave/close/list/messages/read/catch-up/send/status`.
+- CLI: `group create/join/leave/close/list/messages/history/read/catch-up/send/status`.
+  `send` reports `target_stale=true` for a recipient without a recent
+  heartbeat/notifier; the message is still queued. Audit event JSON is emitted
+  on stderr, while stdout is the command result.
 - Liveness: `bus liveness --agent-id <id>` separates "notifier process alive" from
   "model answered". `model_liveness` comes from opencode's `session.get` outcome for
   `agent_type=opencode` only; every other adapter returns `unknown` with

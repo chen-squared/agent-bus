@@ -62,6 +62,21 @@ def main() -> int:
         else:
             check("alice sent 25 messages", True)
 
+        print("history is readable before catch-up and does not move cursors")
+        proc = cli("group", "history", "--group-id", "catch", "--agent-id", "bob", "--limit", "10", agent="bob")
+        hist = jout(proc)
+        seqs = [m.get("seq") for m in hist.get("messages", [])]
+        check("history returns the newest page", proc.returncode == 0 and seqs == list(range(16, 26)), str(seqs))
+        check("history reports older pages", hist.get("has_more") is True and hist.get("next_before_seq") == 16, str(hist)[:240])
+        proc = cli("group", "history", "--group-id", "catch", "--agent-id", "bob", "--limit", "10", "--before-seq", "16", agent="bob")
+        older = jout(proc)
+        check("history pages backwards", [m.get("seq") for m in older.get("messages", [])] == list(range(6, 16)), str(older)[:240])
+        proc = cli("group", "history", "--group-id", "catch", "--agent-id", "bob", "--limit", "100", agent="bob")
+        full = jout(proc)
+        check("history returns the whole store", full.get("count") == 25 and full.get("has_more") is False, str(full)[:240])
+        check("history exposes senders", all(m.get("sender_agent") == "alice" for m in full.get("messages", [])), str(full)[:240])
+        check("history zero limit is rejected", cli("group", "history", "--group-id", "catch", "--agent-id", "bob", "--limit", "0", agent="bob").returncode != 0)
+
         proc = cli("group", "catch-up", "--group-id", "catch", "--agent-id", "bob", "--limit", "10", agent="bob")
         out = jout(proc)
         check("catch-up succeeds", proc.returncode == 0 and out.get("ok") is True, proc.stderr[:240])

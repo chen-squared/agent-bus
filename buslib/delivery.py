@@ -107,7 +107,7 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
                 text = str(r["payload"])
             text = text.replace("\\n", " ").replace("\n", " ")
             if len(text) > 500:
-                text = text[:500] + "…+" + str(len(text) - 500) + " chars (full: bus group messages --group-id " + g["group_id"] + " --agent-id " + agent_id + ")"
+                text = text[:500] + "…+" + str(len(text) - 500) + " chars (full: agent-bus group messages --group-id " + g["group_id"] + " --agent-id " + agent_id + ")"
             lines.append(f"  seq {r['seq']} from {r['sender_agent']}: {text}")
         digest_text = "\n".join(lines)
         message = {

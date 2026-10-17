@@ -86,7 +86,7 @@ def cmd_message_show(args: argparse.Namespace) -> int:
             text = text.replace("\\n", " ").replace("\n", " ")[:240]
             lines.append(f"  seq {r['seq']} from {r['sender_agent']}: {text}")
         if omitted:
-            lines.append(f"  ... +{omitted} more (full: bus group messages --group-id {group_id} --agent-id {args.agent_id})")
+            lines.append(f"  ... +{omitted} more (full: agent-bus group messages --group-id {group_id} --agent-id {args.agent_id})")
         digest = "\n".join(lines)
         conn.close()
         print(json_dumps({"ok": True, "agent_id": args.agent_id, "message": {"message_id": args.message_id, "from_agent": group_id, "to_agent": args.agent_id, "thread_id": group_id, "payload": json.dumps({"text": digest}, ensure_ascii=False), "status": "delivered"}}))

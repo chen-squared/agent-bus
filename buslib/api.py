@@ -308,5 +308,16 @@ class Bus:
         agent = self._require_agent()
         return self._call("group", "catch-up", "--group-id", group_id, "--agent-id", agent, "--limit", limit)
 
+    def group_history(
+        self, group_id: str, *, limit: int = 50, before_seq: int | None = None,
+    ) -> dict[str, Any]:
+        agent = self._require_agent()
+        argv: list[Any] = [
+            "group", "history", "--group-id", group_id, "--agent-id", agent, "--limit", limit,
+        ]
+        if before_seq is not None:
+            argv += ["--before-seq", before_seq]
+        return self._call(*argv)
+
 
 __all__ = ["Bus", "BusError"]

@@ -673,11 +673,16 @@ Talk:
   agent-bus inbox --agent-id <id>
   agent-bus ack --agent-id <id> --message-id <id>
 
+`send` may report target_stale=true when the recipient has no recent
+heartbeat/notifier; the message is still queued. Start a notifier or poll
+`inbox`. Audit event lines go to stderr; stdout is the command result JSON.
+
 Groups:
   agent-bus group create --from <id> --group-id <group> --topic "..."
   agent-bus group join --group-id <group> --agent-id <peer>
   agent-bus group send --from <id> --group-id <group> --text "hello"
   agent-bus group messages --group-id <group> --agent-id <id>
+  agent-bus group history --group-id <group> --agent-id <id>
   agent-bus group read --group-id <group> --agent-id <id> --seq <n>
   agent-bus group catch-up --group-id <group> --agent-id <id>
 

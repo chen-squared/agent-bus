@@ -157,7 +157,7 @@ Group send gates are not HTTP statuses: each is a JSON object printed to **stder
   - All three need an operator identity: pass `--agent-id <you>` or export `AGENT_BUS_AGENT`. `dlq retry` now resets `expires_at`, so the requeued message survives the next sweep.
 - Verification trap after upgrading digest code: a restarted notifier whose cursor already equals latest emits no new rows, so fresh group traffic is required to exercise the new path; zero new rows right after restart means no traffic, not a broken fix.
 
-Queued sends are stored, not synchronous-network. A running notifier flushes up to three pending outbox rows every 30s (`AGENT_BUS_OUTBOX_FLUSH`, 0 disables it), so cross-machine delivery no longer depends on someone running `bus outbox flush`. For `opencode` and watched `command` adapters a busy recipient is retried and reached later; for `tmux`, pane-busy consumes the retry budget and dead-letters after 5 attempts, so later delivery is not guaranteed there.
+Queued sends are stored, not synchronous-network. A running notifier flushes up to three pending outbox rows every 30s (`AGENT_BUS_OUTBOX_FLUSH`, 0 disables it), so cross-machine delivery no longer depends on someone running `agent-bus outbox flush`. A send result may include `"target_stale":true` when the recipient has no recent heartbeat/notifier; the row is still queued, so start a notifier or poll `inbox` and `ack`. Audit event JSON lines go to stderr; stdout is the command result object. For `opencode` and watched `command` adapters a busy recipient is retried and reached later; for `tmux`, pane-busy consumes the retry budget and dead-letters after 5 attempts, so later delivery is not guaranteed there.
 
 ### 6. Group chat
 
@@ -166,6 +166,7 @@ agent-bus group create --from "$ME" --group-id demo-group --topic "shared proble
 agent-bus group join --group-id demo-group --agent-id muse-spark
 agent-bus group send --from "$ME" --group-id demo-group --text "..."
 agent-bus group messages --group-id demo-group --agent-id "$ME"
+agent-bus group history --group-id demo-group --agent-id "$ME" [--limit 50] [--before-seq <n>]
 agent-bus group read --group-id demo-group --agent-id "$ME" --seq <n>
 # page + ack everything in one safe command (uses the same clamps/auth)
 agent-bus group catch-up --group-id demo-group --agent-id "$ME"
@@ -179,7 +180,7 @@ Three cursors per member live in `group_read_state` and never write each other:
 
 So a manual `group read` never suppresses digests -- verified with 60 unread: `read --seq 60` first, the notifier still rendered all 60 in 12 pages of 5, no gaps and no dupes. And a digest never clears the read gate, and never raises `last_served_seq` either: a digest is not a receipt for a gap you chose to acknowledge.
 
-`group messages` is capped (`--limit`, default 50, `0` means counters only) and pages the **oldest** unread rows while reporting `latest_seq`, so one capped call plus one `read --seq <latest>` used to mark the unseen tail as read: with 60 unread the call returns seq 1-50, `read --seq 60` landed the cursor on 60, and seq 51-60 were gone from the unread view without anyone ever seeing them. The rows were never deleted -- they stay in `group_messages`, retrievable by seq -- but nothing pointed at them any more.
+`group messages` is capped (`--limit`, default 50, `0` means counters only) and pages the **oldest** unread rows while reporting `latest_seq`, so one capped call plus one `read --seq <latest>` used to mark the unseen tail as read: with 60 unread the call returns seq 1-50, `read --seq 60` landed the cursor on 60, and seq 51-60 were gone from the unread view without anyone ever seeing them. The rows were never deleted -- they stay in `group_messages` -- but the unread view no longer pointed at them. `group history` exposes stored rows (member-only, no cursor movement) for audit and for late joiners who need sender/order context.
 
 That is now enforced rather than advised: `group read` clamps to `max(last_read_seq, last_served_seq)` and warns on stderr (`asked to ack seq 60, but group messages has only served you through 50; cursor stopped at 50`), reporting `"clamped":true` and `unacknowledged_seq_count` in its JSON. The read gate stays armed until you page the rest, so the drain loop is forced: read to `.served_through_seq`, call again, repeat until `"truncated":false`. `--allow-gap` acknowledges unseen seqs explicitly and loudly; it exists for content you obtained outside `group messages`, and it prints which seqs it burned.
 
@@ -197,7 +198,7 @@ That is now enforced rather than advised: `group read` clamps to `max(last_read_
 - Leaving a group drops that member's `read_state`, so rejoining restarts digests from seq 0 in 5-message pages.
 - Group digest self-exclusion: a sender does not receive its own seqs unless no external seqs remain, and the cursor still advances past scan windows that contain only its own messages.
 
-For a `group-digest-*` pointer (group wake), group-digest pointers: bus message show resolves them for active members (owner row when present, bounded reconstruction otherwise); `bus group messages` remains the universal fallback. 1:1 pointers use `bus message show`.
+For a `group-digest-*` pointer (group wake), group-digest pointers: `agent-bus message show` resolves them for active members (owner row when present, bounded reconstruction otherwise); `agent-bus group messages` remains the universal fallback. 1:1 pointers use `agent-bus message show`.
 ### Non-OpenCode agents
 
 The CLI is universal. The adapter determines how delivery happens:
@@ -207,7 +208,7 @@ The CLI is universal. The adapter determines how delivery happens:
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
 - For tmux: busy pane rejections no longer consume retry budget; use it only as final fallback, and note the idle check is a 0.3s heuristic, not a prompt-state gate.
 
-Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes and pulls full text via `bus message show` for 1-1 pointers, or for `group-digest-*` pointers (message show resolves them for active members, owner row or bounded reconstruction; `bus group messages` remains fallback) (text never crosses a shell). The listener is unbounded (mkdir lock plus pid/heartbeat, no AGENT_BUS_WAKE_LIMIT); it is hooked on both Stop and UserPromptSubmit (timeout 3600) so coverage spans turn boundaries and the start of each turn (measured keepalive 1s, 104s, 381s, 473s; arrival-to-wake stays ~2s). Coverage is near-continuous but not continuous: while a wake is being handled there is no live listener, so messages arriving then wait for the next hook event.
+Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes and pulls full text via `agent-bus message show` for 1-1 pointers, or for `group-digest-*` pointers (message show resolves them for active members, owner row or bounded reconstruction; `agent-bus group messages` remains fallback) (text never crosses a shell). The listener is unbounded (mkdir lock plus pid/heartbeat, no AGENT_BUS_WAKE_LIMIT); it is hooked on both Stop and UserPromptSubmit (timeout 3600) so coverage spans turn boundaries and the start of each turn (measured keepalive 1s, 104s, 381s, 473s; arrival-to-wake stays ~2s). Coverage is near-continuous but not continuous: while a wake is being handled there is no live listener, so messages arriving then wait for the next hook event.
 
 Official generic watcher invocation (`agent-bus up` owns the watcher; your
 hook handles one message, no custom loop):
@@ -219,7 +220,7 @@ agent-bus up --agent-id "$ME" --agent-type cursor --adapter command \
 ```
 
 Recognized placeholders: `{message_id}`, `{thread_id}`, `{from_agent}`, `{agent_id}`, `{session_id}`, `{text}`.
-Pointer-first is the safe default. `{text}` interpolation is disabled by default because it is a shell-injection surface; use the `AGENT_BUS_*` environment variables or stdin instead. Starting a command notifier with a template containing `{text}` now fails fast unless `AGENT_BUS_ALLOW_UNSAFE_TEXT=1` is explicitly set. After a hook fires, read the full payload with `bus message show --agent-id <me> --message-id <id>`. Hooks also receive `AGENT_BUS_*` environment variables and stdin text, so they can avoid interpolation entirely.
+Pointer-first is the safe default. `{text}` interpolation is disabled by default because it is a shell-injection surface; use the `AGENT_BUS_*` environment variables or stdin instead. Starting a command notifier with a template containing `{text}` now fails fast unless `AGENT_BUS_ALLOW_UNSAFE_TEXT=1` is explicitly set. After a hook fires, read the full payload with `agent-bus message show --agent-id <me> --message-id <id>`. Hooks also receive `AGENT_BUS_*` environment variables and stdin text, so they can avoid interpolation entirely.
 
 Ack semantics:
 - Hook exit 0 means "accepted", NOT "agent understood". Exit 0 only after durable local queueing.

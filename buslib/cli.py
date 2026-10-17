@@ -15,9 +15,9 @@ from .blobs import cmd_blob_gc, cmd_blob_get, cmd_blob_list, cmd_blob_put
 from .bootstrap import cmd_down, cmd_guide, cmd_home, cmd_up
 from .db import cmd_init
 from .groups import (
-    cmd_group_catch_up, cmd_group_close, cmd_group_create, cmd_group_join,
-    cmd_group_leave, cmd_group_list, cmd_group_messages, cmd_group_read,
-    cmd_group_send, cmd_group_status,
+    cmd_group_catch_up, cmd_group_close, cmd_group_create, cmd_group_history,
+    cmd_group_join, cmd_group_leave, cmd_group_list, cmd_group_messages,
+    cmd_group_read, cmd_group_send, cmd_group_status,
 )
 from .maintenance import (
     cmd_dlq_discard, cmd_dlq_list, cmd_dlq_retry, cmd_prune, cmd_sweep,
@@ -100,7 +100,7 @@ def main() -> int:
 
     p = sub.add_parser("register", help="register or update agent")
     p.add_argument("--agent-id", required=True)
-    p.add_argument("--agent-type", required=True, help="opencode|claude-code|cursor|...")
+    p.add_argument("--agent-type", required=True, help="opencode|claude-code|cursor|command|tmux|...")
     p.add_argument("--display-name")
     p.add_argument("--model-tier")
     p.add_argument("--capabilities", help="comma list or JSON list")
@@ -255,6 +255,12 @@ def main() -> int:
     gm.add_argument("--agent-id")
     gm.add_argument("--limit", type=nonneg_int, default=50, help="oldest unread rows to return; 0 means counters only")
     gm.set_defaults(func=cmd_group_messages)
+    ghist = g.add_parser("history", help="read stored group history (member-only; does not move read cursors)")
+    ghist.add_argument("--group-id", required=True)
+    ghist.add_argument("--agent-id", required=True)
+    ghist.add_argument("--limit", type=nonneg_int, default=50, help="newest rows to return; must be > 0")
+    ghist.add_argument("--before-seq", type=nonneg_int, help="return rows with seq below this cursor")
+    ghist.set_defaults(func=cmd_group_history)
     gr = g.add_parser("read", help="ack seqs as read (clamped to what group messages actually served)")
     gr.add_argument("--group-id", required=True)
     gr.add_argument("--agent-id", required=True)

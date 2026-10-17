@@ -277,6 +277,58 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_group_history(args: argparse.Namespace) -> int:
+    """Read stored group messages without moving any read cursor.
+
+    `group messages` is intentionally an unread/digest view: after a catch-up
+    it returns nothing, so a late joiner or an auditor has no CLI way to inspect
+    sender order. The rows were always retained; expose them explicitly instead
+    of forcing a sqlite query.
+    """
+    validate_id("group_id", args.group_id)
+    validate_id("agent_id", args.agent_id)
+    conn = connect()
+    if conn.execute("SELECT 1 FROM groups WHERE group_id=?", (args.group_id,)).fetchone() is None:
+        conn.close()
+        raise SystemExit(f"error: unknown group {args.group_id}")
+    require_auth(conn, args.agent_id)
+    _group_require_member(conn, args.group_id, args.agent_id)
+    limit = args.limit if args.limit is not None else 50
+    if limit <= 0:
+        conn.close()
+        raise SystemExit("error: group history --limit must be > 0")
+    latest = conn.execute(
+        "SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?",
+        (args.group_id,),
+    ).fetchone()["seq"]
+    before = args.before_seq if args.before_seq is not None else latest + 1
+    rows = conn.execute(
+        "SELECT * FROM group_messages WHERE group_id=? AND seq<? ORDER BY seq DESC LIMIT ?",
+        (args.group_id, before, limit),
+    ).fetchall()
+    rows.reverse()
+    oldest = rows[0]["seq"] if rows else None
+    has_more = False
+    if oldest is not None:
+        has_more = conn.execute(
+            "SELECT 1 FROM group_messages WHERE group_id=? AND seq<? LIMIT 1",
+            (args.group_id, oldest),
+        ).fetchone() is not None
+    print(json_dumps({
+        "ok": True,
+        "group_id": args.group_id,
+        "agent_id": args.agent_id,
+        "latest_seq": latest,
+        "before_seq": before,
+        "count": len(rows),
+        "has_more": has_more,
+        "next_before_seq": oldest if has_more else None,
+        "messages": [row_to_dict(r) for r in rows],
+    }))
+    conn.close()
+    return 0
+
+
 def cmd_group_read(args: argparse.Namespace) -> int:
     validate_id("group_id", args.group_id)
     conn = connect()
@@ -606,6 +658,7 @@ def cmd_group_status(args: argparse.Namespace) -> int:
 __all__ = [
     "cmd_group_catch_up",
     "cmd_group_close",
+    "cmd_group_history",
     "cmd_group_create",
     "cmd_group_join",
     "cmd_group_leave",
