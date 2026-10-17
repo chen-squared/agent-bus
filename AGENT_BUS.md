@@ -19,7 +19,10 @@ transport remains available as a backup.
   compatibility shim)
 - Implementation: `/Users/chen/Developer/agent-bus/buslib/` (`config`, `db`,
   `blobs`, `messaging`, `groups`, `remote`, `agents`, `maintenance`, `delivery`,
-  `adapters/`, `cli`)
+  `notifier`, `adapters/`, `daemon/`, `cli`)
+- Packaging: `pyproject.toml` exposes `agent-bus`, `agent-bus-daemon`, and
+  `agent-bus-notifier` console scripts; `bus.py`/`bus_agent.py`/`bus_daemon.py`
+  remain the direct-script entry points.
 - Notifier: `/Users/chen/Developer/agent-bus/bus_agent.py`
 - Tokens (0600): `/Users/chen/Developer/agent-bus/tokens/<agent>.token`
 - Agent logs: `/Users/chen/Developer/agent-bus/bus_agent_<agent>.log`

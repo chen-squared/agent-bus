@@ -20,3 +20,7 @@ probe-attachment.txt
 # Bus watcher state
 .bus_inbox_*
 .claude/settings.local.json
+# Python packaging
+build/
+dist/
+*.egg-info/

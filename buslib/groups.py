@@ -333,6 +333,77 @@ def cmd_group_read(args: argparse.Namespace) -> int:
     return 0
 
 
+def _group_send_gates(
+    conn: sqlite3.Connection, group: sqlite3.Row, agent_id: str, now_ts: float
+) -> int:
+    """Evaluate the read, rate, ceiling, and backpressure gates.
+
+    Runs inside the caller's BEGIN IMMEDIATE transaction so every check and the
+    subsequent seq assignment guard the same state. Returns the latest seq.
+    """
+    group_id = group["group_id"]
+    latest = conn.execute(
+        "SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (group_id,)
+    ).fetchone()["seq"]
+    read_state = conn.execute(
+        "SELECT last_read_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (group_id, agent_id)
+    ).fetchone()
+    last_read = read_state["last_read_seq"] if read_state else 0
+    digest_state = conn.execute(
+        "SELECT last_digest_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (group_id, agent_id)
+    ).fetchone()
+    last_digest = digest_state["last_digest_seq"] if digest_state and digest_state["last_digest_seq"] is not None else 0
+    if latest > 0 and last_read < latest:
+        raise SystemExit(
+            json_dumps(
+                {
+                    "error": "must confirm latest message first",
+                    "latest_seq": latest,
+                    "last_read_seq": last_read,
+                    "last_digest_seq": last_digest,
+                    "digest_health_hint": (
+                        "caught-up messages may still be unprocessed by your notifier"
+                        if last_digest < latest
+                        else "digest path is healthy, only a manual read catch-up is missing"
+                    ),
+                }
+            )
+        )
+    # Re-read the member row under the write lock: the pre-tx read could
+    # be stale against a concurrent send by the same member.
+    member = conn.execute(
+        "SELECT * FROM group_members WHERE group_id=? AND agent_id=?", (group_id, agent_id)
+    ).fetchone()
+    if member is None or member["status"] != "active":
+        raise SystemExit(f"error: {agent_id} is not active in {group_id}")
+    rate = member["rate_seconds"] if member["rate_seconds"] is not None else (group["rate_seconds"] if group["rate_seconds"] is not None else 2)
+    # now_ts is captured after BEGIN IMMEDIATE. Clamp a negative delta
+    # (clock skew) to zero instead of reporting wait > rate.
+    dt = max(0.0, now_ts - float(member["last_sent_at"])) if member["last_sent_at"] else 0.0
+    if rate > 0 and member["last_sent_at"] and dt < rate:
+        wait = round(rate - dt, 3)
+        raise SystemExit(json_dumps({"error": "rate limited", "retry_after_seconds": wait}))
+    # Same falsiness rule as cmd_group_create: a stored 0 means 0, not the default.
+    ceiling = group["ceiling_per_minute"] if group["ceiling_per_minute"] is not None else 120
+    recent = conn.execute(
+        "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND created_at>?",
+        (group_id, now_ts - 60),
+    ).fetchone()["c"]
+    if recent >= ceiling:
+        raise SystemExit(json_dumps({"error": "group ceiling reached", "retry_after_seconds": 5}))
+    backlog = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM group_read_state grs
+        JOIN group_members gm ON gm.group_id=grs.group_id AND gm.agent_id=grs.agent_id
+        WHERE grs.group_id=? AND gm.status='active' AND grs.last_read_seq < ?
+        """,
+        (group_id, latest),
+    ).fetchone()["c"]
+    if backlog > (group["backlog_threshold"] if group["backlog_threshold"] is not None else 50):
+        raise SystemExit(json_dumps({"error": "group backpressure: too many unread participants"}))
+    return latest
+
+
 def cmd_group_send(args: argparse.Namespace) -> int:
     validate_id("group_id", args.group_id)
     conn = connect()
@@ -344,7 +415,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     if group["status"] != "active":
         conn.close()
         raise SystemExit(f"error: group {args.group_id} is {group['status']}")
-    member = _group_require_member(conn, args.group_id, args.from_agent)
+    _group_require_member(conn, args.group_id, args.from_agent)
     # Input validation runs BEFORE the gates: a blank message to a group you
     # have not caught up on used to report "must confirm latest message first"
     # instead of "text must not be empty".
@@ -368,58 +439,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         # made dt negative when another sender held the lock, which tripped
         # the rate gate even for a member that had not sent recently.
         now_ts = now()
-        latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
-        read_state = conn.execute("SELECT last_read_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.from_agent)).fetchone()
-        last_read = read_state["last_read_seq"] if read_state else 0
-        digest_state = conn.execute(
-            "SELECT last_digest_seq FROM group_read_state WHERE group_id=? AND agent_id=?",
-            (args.group_id, args.from_agent),
-        ).fetchone()
-        last_digest = digest_state["last_digest_seq"] if digest_state and digest_state["last_digest_seq"] is not None else 0
-        if latest > 0 and last_read < latest:
-            raise SystemExit(
-                json_dumps(
-                    {
-                        "error": "must confirm latest message first",
-                        "latest_seq": latest,
-                        "last_read_seq": last_read,
-                        "last_digest_seq": last_digest,
-                        "digest_health_hint": (
-                            "caught-up messages may still be unprocessed by your notifier"
-                            if last_digest < latest
-                            else "digest path is healthy, only a manual read catch-up is missing"
-                        ),
-                    }
-                )
-            )
-        # Re-read the member row under the write lock: the pre-tx read could
-        # be stale against a concurrent send by the same member.
-        member = conn.execute("SELECT * FROM group_members WHERE group_id=? AND agent_id=?", (args.group_id, args.from_agent)).fetchone()
-        rate = (member["rate_seconds"] if member["rate_seconds"] is not None else (group["rate_seconds"] if group["rate_seconds"] is not None else 2))
-        # now_ts is captured after BEGIN IMMEDIATE. Clamp a negative delta
-        # (clock skew) to zero instead of reporting wait > rate.
-        dt = max(0.0, now_ts - float(member["last_sent_at"])) if member["last_sent_at"] else 0.0
-        if rate > 0 and member["last_sent_at"] and dt < rate:
-            wait = round(rate - dt, 3)
-            raise SystemExit(json_dumps({"error": "rate limited", "retry_after_seconds": wait}))
-        # Same falsiness rule as cmd_group_create: a stored 0 means 0, not the default.
-        ceiling = group["ceiling_per_minute"] if group["ceiling_per_minute"] is not None else 120
-        recent = conn.execute(
-            "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND created_at>?",
-            (args.group_id, now_ts - 60),
-        ).fetchone()["c"]
-        if recent >= ceiling:
-            raise SystemExit(json_dumps({"error": "group ceiling reached", "retry_after_seconds": 5}))
-        backlog = conn.execute(
-            """
-            SELECT COUNT(*) AS c FROM group_read_state grs
-            JOIN group_members gm ON gm.group_id=grs.group_id AND gm.agent_id=grs.agent_id
-            WHERE grs.group_id=? AND gm.status='active' AND grs.last_read_seq < ?
-            """,
-            (args.group_id, latest),
-        ).fetchone()["c"]
-        if backlog > (group["backlog_threshold"] if group["backlog_threshold"] is not None else 50):
-            raise SystemExit(json_dumps({"error": "group backpressure: too many unread participants"}))
+        latest = _group_send_gates(conn, group, args.from_agent, now_ts)
         next_seq = latest + 1
         # `if args.ttl` swallowed --ttl 0; an explicit 0 is explicit.
         expires = now_ts + args.ttl if args.ttl is not None else None

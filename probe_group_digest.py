@@ -88,11 +88,11 @@ rc, out, err = cli("group", "join", "--group-id", "g1", "--agent-id", "bob")
 check("bob join", rc == 0, err or out)
 
 import bus  # noqa: E402
-import bus_agent  # noqa: E402
+from buslib.delivery import commit_group_digest, poll_group_digest  # noqa: E402
 
 conn = bus.connect()
-digest_of = lambda aid: bus_agent.poll_group_digest(aid, conn)
-commit = bus_agent.commit_group_digest
+digest_of = lambda aid: poll_group_digest(aid, conn)
+commit = commit_group_digest
 cursor = lambda aid: conn.execute(
     "SELECT last_digest_seq AS s FROM group_read_state WHERE group_id='g1' AND agent_id=?", (aid,)
 ).fetchone()["s"]

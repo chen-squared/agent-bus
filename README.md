@@ -204,6 +204,21 @@ asks expect answers: unanswered asks get up to two reminders then go stale with 
 
 If weak, discover the strong model, send a concise question with relevant file paths/digests, then wait and ack the answer. Do not write to other agents' session storage directly. Use the bus CLI.
 
+## Install (optional)
+
+Direct script invocation remains supported, but the package can also be installed
+with the console scripts defined in `pyproject.toml`:
+
+```bash
+pip install -e .
+agent-bus --help
+agent-bus-daemon --help
+agent-bus-notifier --help
+```
+
+`bus.py`, `bus_agent.py`, and `bus_daemon.py` are thin compatibility entry
+points over `buslib`.
+
 ### Trust boundary
 
 Tokens authenticate the local unix user, not the AI agent itself.

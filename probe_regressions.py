@@ -42,7 +42,7 @@ FAIL: list[str] = []
 sys.path.insert(0, HERE)
 
 import bus  # noqa: E402
-import bus_agent  # noqa: E402
+from buslib.adapters import CommandAdapter  # noqa: E402
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -95,7 +95,7 @@ except ValueError:
 check("idempotency scopes differ by sender",
       bus.scoped_idempotency_key("alice", "K") != bus.scoped_idempotency_key("bob", "K"))
 try:
-    bus_agent.CommandAdapter("printf '%s' '{text}'", "s")
+    CommandAdapter("printf '%s' '{text}'", "s")
     check("CommandAdapter blocks {text}", False)
 except SystemExit:
     check("CommandAdapter blocks {text}", True)

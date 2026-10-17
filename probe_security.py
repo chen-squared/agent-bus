@@ -250,8 +250,8 @@ check("--group 拼写被规范化为 --group-id 并可执行", rc == 0 and '"ok"
 
 print("M daemon 可 import(heredoc 残留已删)")
 try:
-    import bus_daemon  # noqa: F401
-    check("import bus_daemon 无 NameError", True)
+    import bus_daemon
+    check("import bus_daemon 无 NameError", bus_daemon.DaemonHandler is not None)
 except NameError as exc:
     check("import bus_daemon 无 NameError", False, str(exc))
 
