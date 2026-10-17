@@ -15,7 +15,10 @@ transport remains available as a backup.
 ## Core files
 
 - Database: `/Users/chen/Developer/agent-bus/bus.db`
-- CLI: `/Users/chen/Developer/agent-bus/bus.py`
+- CLI entry point: `/Users/chen/Developer/agent-bus/bus.py` (thin
+  compatibility shim)
+- Implementation: `/Users/chen/Developer/agent-bus/buslib/` (`config`, `db`,
+  `blobs`, `messaging`, `groups`, `remote`, `cli`)
 - Notifier: `/Users/chen/Developer/agent-bus/bus_agent.py`
 - Tokens (0600): `/Users/chen/Developer/agent-bus/tokens/<agent>.token`
 - Agent logs: `/Users/chen/Developer/agent-bus/bus_agent_<agent>.log`

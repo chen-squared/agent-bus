@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile
-        run: python3 -m compileall -q bus.py bus_agent.py bus_daemon.py bus_ssh_gateway.py probe_*.py
+        run: python3 -m compileall -q bus.py buslib bus_agent.py bus_daemon.py bus_ssh_gateway.py probe_*.py
       - name: Shell syntax
         run: bash -n bus_wake.sh
       - name: Group gates probe
