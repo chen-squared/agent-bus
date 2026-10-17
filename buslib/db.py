@@ -9,7 +9,8 @@ import sqlite3
 from pathlib import Path
 
 from .config import (
-    DEFAULT_DB, chmod_private, json_dumps, load_token, machine_id, sha256_text,
+    DEFAULT_DB, chmod_private, ensure_home, home_info, json_dumps, load_token,
+    machine_id, sha256_text,
 )
 from .validation import validate_id
 
@@ -270,8 +271,10 @@ def require_operator_auth(conn: sqlite3.Connection, agent_id: str | None) -> str
 
 
 def cmd_init(_args: argparse.Namespace) -> int:
+    ensure_home()
     conn = connect()
-    print(json_dumps({"ok": True, "db": str(db_path()), "path": str(db_path())}))
+    info = home_info()
+    print(json_dumps({"ok": True, "path": str(db_path()), **info}))
     conn.close()
     return 0
 

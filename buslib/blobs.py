@@ -11,13 +11,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .config import BUS_HOME, chmod_private, json_dumps, now
+from .config import blob_dir_path, chmod_private, json_dumps, now
 from .db import connect
 from .validation import validate_sha256
 
 
 def blob_dir() -> Path:
-    root = Path(os.environ.get("AGENT_BUS_BLOB_DIR", str(BUS_HOME / "blobs"))).expanduser().resolve()
+    root = blob_dir_path()
     root.mkdir(parents=True, exist_ok=True)
     chmod_private(root, 0o700)
     return root

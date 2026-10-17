@@ -24,3 +24,7 @@ probe-attachment.txt
 build/
 dist/
 *.egg-info/
+
+# Packaged service state (source checkout)
+/run/
+/logs/

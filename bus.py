@@ -11,6 +11,7 @@ implementation lives in `buslib/`; names are re-exported here because
 
 from __future__ import annotations
 
+from buslib import Bus, BusError, __version__  # noqa: F401
 from buslib.config import *  # noqa: F401,F403
 from buslib.validation import *  # noqa: F401,F403
 from buslib.db import *  # noqa: F401,F403

@@ -12,12 +12,10 @@ import argparse
 import os
 import sqlite3
 import time
-from pathlib import Path
-
 from .adapters import Adapter, AdapterError, CommandAdapter, OpencodeAdapter, TmuxAdapter
 from .agents import cmd_heartbeat, resolve_opencode_cli, sweep_agents
-from .config import load_token, row_to_dict, sha256_text
-from .db import connect
+from .config import BUS_HOME, load_token, row_to_dict, sha256_text
+from .db import connect, db_path
 from .delivery import commit_group_digest, materialize_attachments, poll_group_digest
 from .maintenance import sweep_expired, sweep_nudges
 from .messaging import cmd_ack, fetch_inbox
@@ -88,7 +86,7 @@ def main() -> int:
         help="allow {text} interpolation into the shell notify template (unsafe)",
     )
     parser.add_argument("--cli", default=os.environ.get("AGENT_BUS_CLI", DEFAULT_CLI))
-    parser.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD", str(Path(__file__).resolve().parent)))
+    parser.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD", os.getcwd()), help="working directory for the adapter (default: current directory)")
     parser.add_argument("--poll", type=float, default=_env_float("AGENT_BUS_POLL", 1.0))
     parser.add_argument("--heartbeat", type=float, default=_env_float("AGENT_BUS_HEARTBEAT", 5.0))
     parser.add_argument("--sweep", type=float, default=_env_float("AGENT_BUS_SWEEP_INTERVAL", 10.0))
@@ -132,7 +130,7 @@ def main() -> int:
     last_outbox = 0.0
     adapter_session = getattr(adapter, "session_id", getattr(adapter, "target", ""))
     explicit_session = args.session_id is not None
-    log(f"started adapter={adapter_kind} session={adapter_session}", agent_id)
+    log(f"started adapter={adapter_kind} session={adapter_session} home={BUS_HOME} db={db_path()}", agent_id)
 
     def safe_ack(message_id: str) -> None:
         # cmd_ack raises SystemExit (e.g. message vanished mid-flight);

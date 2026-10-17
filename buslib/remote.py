@@ -8,8 +8,8 @@ import sqlite3
 import urllib.request
 from typing import Any
 
-from .config import audit_log, json_dumps, machine_id, now, row_to_dict
-from .db import connect, require_operator_auth, tx
+from .config import audit_log, home_info, json_dumps, machine_id, now, row_to_dict
+from .db import connect, db_path, require_operator_auth, tx
 from .validation import validate_id
 
 
@@ -105,6 +105,8 @@ def cmd_status(_args: argparse.Namespace) -> int:
             {
                 "ok": True,
                 "machine_id": machine_id(),
+                "db": str(db_path()),
+                "home": home_info(),
                 "agents": {r["status"]: r["c"] for r in agents},
                 "inactive_peers": [r["peer_name"] for r in peers if r["status"] not in {"ok", "configured"}],
                 "outbox": {r["status"]: r["c"] for r in outbox},

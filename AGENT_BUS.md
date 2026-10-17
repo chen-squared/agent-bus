@@ -4,28 +4,60 @@ Generic, agent-agnostic local message bus. v0 uses a single SQLite database
 (WAL mode) plus a per-agent notifier. No central daemon. The older HTTP/inbox
 transport remains available as a backup.
 
-## Current cat-jam registration
+## Install / run as a library
 
-- Agent: `cat-jam`
-- Model tier: `weak`
-- Capabilities: `code-edit, terminal, file-read, file-write, search, opencode-tools`
-- Session: `ses_ec4900da9ffdQ2h93dNCqMozV7`
-- Strong model partner: `muse-spark` (session `ses_ec48cb8fcffeRvigAKmkEPHFBg`)
+The project is a normal Python package with a small CLI surface. The intended
+deployment is one venv per agent host:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e /path/to/agent-bus      # or: pip install agent-bus
+agent-bus guide
+agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...>
+```
+
+`agent-bus up` registers the agent, starts a detached notifier, records a
+pid/log pair, and prints JSON. `--daemon` also starts the localhost HTTP
+handoff daemon. `agent-bus down --agent-id <id>` stops the notifier.
+`agent-bus home` reports the resolved state directory.
+
+Python embedding uses the same commands:
+
+```python
+from buslib import Bus
+
+alice = Bus("alice")
+alice.start(agent_type="opencode", session_id="ses_...")
+alice.send("bob", "hello")
+alice.stop()
+```
+
+State resolution:
+
+- `AGENT_BUS_HOME` always wins.
+- An editable/source checkout keeps state beside the code, so an existing
+  development bus is preserved.
+- A wheel/normal install uses the platform user-data directory
+  (`~/Library/Application Support/agent-bus` on macOS).
 
 ## Core files
 
-- Database: `/Users/chen/Developer/agent-bus/bus.db`
-- CLI entry point: `/Users/chen/Developer/agent-bus/bus.py` (thin
-  compatibility shim)
-- Implementation: `/Users/chen/Developer/agent-bus/buslib/` (`config`, `db`,
-  `blobs`, `messaging`, `groups`, `remote`, `agents`, `maintenance`, `delivery`,
-  `notifier`, `adapters/`, `daemon/`, `cli`)
+- Implementation: `buslib/` (`config`, `db`, `blobs`, `messaging`, `groups`,
+  `remote`, `agents`, `maintenance`, `delivery`, `notifier`, `bootstrap`,
+  `adapters/`, `daemon/`, `cli`)
 - Packaging: `pyproject.toml` exposes `agent-bus`, `agent-bus-daemon`, and
   `agent-bus-notifier` console scripts; `bus.py`/`bus_agent.py`/`bus_daemon.py`
-  remain the direct-script entry points.
-- Notifier: `/Users/chen/Developer/agent-bus/bus_agent.py`
-- Tokens (0600): `/Users/chen/Developer/agent-bus/tokens/<agent>.token`
-- Agent logs: `/Users/chen/Developer/agent-bus/bus_agent_<agent>.log`
+  remain thin compatibility shims.
+- State: `AGENT_BUS_HOME` (or the source checkout / platform data dir above).
+  It contains `bus.db`, `tokens/<agent>.token` (0600), `blobs/`, `run/`, and
+  `logs/`.
+- Notifier logs: `$AGENT_BUS_HOME/logs/notifier-<agent>.log`; pid records:
+  `$AGENT_BUS_HOME/run/notifier-<agent>.json`.
+- Daemon logs/pid: `$AGENT_BUS_HOME/logs/daemon-<port>.log` and
+  `$AGENT_BUS_HOME/run/daemon-<port>.json`.
+- Direct-script logs and pid files (`bus_agent_<agent>.log`,
+  `.bus_agent_<agent>.pid`) are still recognized for compatibility.
 
 ## Security v0
 
@@ -86,9 +118,12 @@ Behavior changes over the v0 above; `probe_security.py` pins each one.
 ## Hardening pass 2 (review fixes)
 
 `probe_regressions.py` pins each of these; `.github/workflows/ci.yml` runs all
-five probes plus compile, shell-syntax, and pyflakes checks. `probe_process.py`
+seven probes plus compile, shell-syntax, and pyflakes checks. `probe_process.py`
 starts the real daemon and notifier and verifies handoff-injection, blob
 serving/range/auth/traversal, and background outbox flush end to end.
+`probe_up.py` verifies the packaged bootstrap: init, detached `up`, idempotent
+`up`, delivery through the command adapter, and `down`. `probe_api.py` does the
+same lifecycle through `from buslib import Bus`.
 
 - Daemon handoff applies the same id charset validation as the CLI to the
   claimed sender, `to_agent`, and `thread_id`; a remote peer can no longer
@@ -136,38 +171,38 @@ serving/range/auth/traversal, and background outbox flush end to end.
 cd /Users/chen/Developer/agent-bus
 
 # Register or update an agent
-python3 bus.py register --agent-id <id> --agent-type <opencode|claude-code|cursor|...> \
+agent-bus register --agent-id <id> --agent-type <opencode|claude-code|cursor|...> \
   --model-tier weak|medium|strong|specialist --capabilities "code-edit,..." \
   --session-id <chat/session> --endpoint <chat/session or tmux target>
 
 # Refresh liveness/session binding
-python3 bus.py heartbeat --agent-id <id> --session-id <id> --endpoint <id>
+agent-bus heartbeat --agent-id <id> --session-id <id> --endpoint <id>
 
 # Discover collaborators
-python3 bus.py agents
-python3 bus.py find --model-tier strong
-python3 bus.py find --capability code-edit --active-only
+agent-bus agents
+agent-bus find --model-tier strong
+agent-bus find --capability code-edit --active-only
 
 # Send a normal message
-python3 bus.py send --from cat-jam --to muse-spark --text "..." --urgency normal
+agent-bus send --from cat-jam --to muse-spark --text "..." --urgency normal
 
 # Weak model asks strong model (async thread; --wait blocks for answer)
-python3 bus.py ask --from cat-jam --to muse-spark --text "..." --wait --timeout 180
+agent-bus ask --from cat-jam --to muse-spark --text "..." --wait --timeout 180
 
 # Answer a thread
-python3 bus.py answer --thread-id <id> --from muse-spark --text "..."
+agent-bus answer --thread-id <id> --from muse-spark --text "..."
 
 # Inspect or reconcile delivery
-python3 bus.py inbox --agent-id <id>
-python3 bus.py ack --agent-id <id> --message-id <id>
+agent-bus inbox --agent-id <id>
+agent-bus ack --agent-id <id> --message-id <id>
 
 # Maintenance
-python3 bus.py sweep
-python3 bus.py prune --days 30 --dry-run   # retention; no automatic deletion
+agent-bus sweep
+agent-bus prune --days 30 --dry-run   # retention; no automatic deletion
 # dlq/peer/outbox need an operator identity: --agent-id <id> or AGENT_BUS_AGENT
-python3 bus.py dlq list
-python3 bus.py dlq retry --message-id <id>
-python3 bus.py dlq discard --message-id <id>
+agent-bus dlq list
+agent-bus dlq retry --message-id <id>
+agent-bus dlq discard --message-id <id>
 ```
 
 ## Reliability model
@@ -189,13 +224,14 @@ python3 bus.py dlq discard --message-id <id>
 Per-agent notifier (poller) runs one process per agent and calls its adapter.
 
 Process-generation caveat: a notifier loads its code once at process start (no
-hot reload). `bus.py` CLI edits apply on the next invocation, but `bus_agent.py`
+hot reload). `agent-bus` CLI edits apply on the next invocation, but notifier
 behavior changes (delivery loop, digest format, logging) stay inactive until
 each notifier process is restarted — verify fixes on freshly started processes,
 since a running process is a frozen snapshot of the code at its start time.
 
 ```sh
-python3 bus_agent.py --agent-id <id> --adapter <opencode|tmux|command> --session-id <id>
+agent-bus up --agent-id <id> --adapter <opencode|tmux|command> \
+  --session-id <id> [--tmux-target <pane>] [--notify-cmd '<hook>']
 ```
 
 Adapters:
@@ -218,15 +254,15 @@ Environment variables:
 ## Example: weak model asks strong model
 
 ```sh
-python3 bus.py find --model-tier strong
-python3 bus.py ask --from cat-jam --to muse-spark \
+agent-bus find --model-tier strong
+agent-bus ask --from cat-jam --to muse-spark \
   --text "Review agent-bus v0 risks and mitigations." --wait --timeout 120
 ```
 
 muse-spark receives the `[bus:...]` user message and answers with:
 
 ```sh
-python3 bus.py answer --thread-id <thread-from-prefix> --from muse-spark --text "..."
+agent-bus answer --thread-id <thread-from-prefix> --from muse-spark --text "..."
 ```
 
 ## Compatibility contract
@@ -277,16 +313,16 @@ end-to-end TTL, local DLQ, and SSH as the auth boundary rather than custom crypt
 
 Machine A:
 ```sh
-python3 bus.py register --agent-id cat-jam ... --machine-id machine-a
-python3 bus.py peer add --peer machine-b --host localhost \
+agent-bus register --agent-id cat-jam ... --machine-id machine-a
+agent-bus peer add --peer machine-b --host localhost \
   --base-url http://127.0.0.1:8782 --token shared-123
 python3 bus_daemon.py --port 8781
 ```
 
 Machine B:
 ```sh
-python3 bus.py register --agent-id muse-spark ... --machine-id machine-b
-python3 bus.py peer add --peer machine-a --host localhost \
+agent-bus register --agent-id muse-spark ... --machine-id machine-b
+agent-bus peer add --peer machine-a --host localhost \
   --base-url http://127.0.0.1:8781 --token shared-123
 python3 bus_daemon.py --port 8782
 ```
@@ -303,8 +339,8 @@ beyond the normal SSH transport.
 ### Cross-machine send
 
 ```sh
-python3 bus.py send --from cat-jam --to muse-spark@machine-b --text "..."
-python3 bus.py outbox flush
+agent-bus send --from cat-jam --to muse-spark@machine-b --text "..."
+agent-bus outbox flush
 ```
 
 Cross-machine answer/read supplies the peer in the recipient address, so

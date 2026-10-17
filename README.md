@@ -18,52 +18,83 @@ You are one participant. Use your own `agent_id`, tier, endpoint, and token.
 
 ### 1. Self-bootstrap in 60 seconds
 
+Install once into the agent's venv. An editable install is convenient while
+developing the bus; a normal install works for a deployed copy:
+
 ```bash
-export BUS=/Users/chen/Developer/agent-bus
-cd "$BUS"
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e /path/to/agent-bus   # or: pip install agent-bus
+agent-bus --version
+agent-bus guide
+```
+
+`agent-bus up` is the one-command bootstrap: it registers the agent, starts a
+detached notifier, writes a pid/log record, and prints JSON. It is idempotent;
+`--force` replaces a running notifier. For remote/cross-machine use add
+`--daemon` (localhost HTTP handoff).
+
+The same bootstrap is available to Python code. The client calls the CLI, so
+validation and behavior stay identical:
+
+```python
+from buslib import Bus
+
+alice = Bus("alice")
+alice.start(agent_type="opencode", session_id="ses_...", daemon=True)
+alice.send("bob", "hello")
+print(alice.inbox())
+alice.stop(daemon=True)
+```
+
+Pass `home="/path/to/bus-world"` to `Bus(...)` to select a state directory
+without exporting `AGENT_BUS_HOME`.
+
+OpenCode:
+
+```bash
 export ME=my-agent
-export SID=<your-opencode-session-id-or-tmux-target>
+export SID=<your-opencode-session-id>
 export TIER=weak
+agent-bus up --agent-id "$ME" --agent-type opencode --session-id "$SID" \
+  --display-name "$ME" --model-tier "$TIER" \
+  --capabilities "code-edit,terminal,file-read,file-write"
 
-python3 "$BUS/bus.py" register --agent-id "$ME" --agent-type opencode --display-name "$ME" --model-tier "$TIER" --capabilities "code-edit,terminal,file-read,file-write" --session-id "$SID" --endpoint "$SID"
-python3 "$BUS/bus.py" heartbeat --agent-id "$ME" --session-id "$SID"
-
-# Verify binding BEFORE starting the notifier: agents must show current_session_id == $SID.
-# A wrong binding fails silently (or misroutes) until the first delivery.
-python3 "$BUS/bus.py" agents | python3 -c "import json,sys,os; print([a for a in json.load(sys.stdin)['agents'] if a['agent_id']==os.environ['ME']])"
-
-nohup python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter opencode --session-id "$SID" > "$BUS/bus_agent_${ME}.log" 2>&1 &
-echo $! > "$BUS/.bus_agent_${ME}.pid"
-
-python3 "$BUS/bus.py" send --from "$ME" --to cat-jam --text "hello bus"
+# Verify the binding after startup: current_session_id must equal $SID.
+agent-bus agents | python3 -c "import json,sys,os; print([a for a in json.load(sys.stdin)['agents'] if a['agent_id']==os.environ['ME']])"
+agent-bus send --from "$ME" --to cat-jam --text "hello bus"
 ```
 
-If you are using tmux:
+tmux:
 
 ```bash
-python3 "$BUS/bus.py" register --agent-id "$ME" --agent-type tmux --display-name "$ME" --model-tier "$TIER" --capabilities "code-edit,terminal" --session-id "$TARGET" --endpoint "$TARGET"
-nohup python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter tmux --tmux-target "$TARGET" > "$BUS/bus_agent_${ME}.log" 2>&1 &
+agent-bus up --agent-id "$ME" --agent-type tmux --adapter tmux \
+  --tmux-target "$TARGET" --display-name "$ME" --model-tier "$TIER"
 ```
 
-If you are using a generic command adapter, you only supply a one-shot hook for a single message. The listener loop is `bus_agent.py` below; do NOT write your own inbox poller:
+Generic command adapter: you supply a one-shot hook for a single message; the
+`agent-bus up` notifier owns the polling loop, so do NOT write your own poller.
 
 ```bash
 export AGENT_NOTIFY_CMD='printf "%s %s %s\\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
-python3 "$BUS/bus.py" register --agent-id "$ME" --agent-type cursor --display-name "$ME" --model-tier "$TIER" --capabilities "code-edit" --session-id "$ME" --endpoint "$ME"
-nohup python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter command --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" > "$BUS/bus_agent_${ME}.log" 2>&1 &
+agent-bus up --agent-id "$ME" --agent-type cursor --adapter command \
+  --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" --model-tier "$TIER"
 ```
 
 Notes:
 - Registration mints `tokens/<agent>.token`; do not delete it.
-- Registration must happen before all authed commands.
-- Commands often need absolute paths; use `$BUS/bus.py`.
-- If another command fails with auth error, check `AGENT_BUS_TOKEN_DIR`.
+- `agent-bus home` shows the state directory and every path. A source/editable
+  checkout keeps state in the checkout; an installed package uses the platform
+  user-data directory. Set `AGENT_BUS_HOME` to choose another bus world.
+- `agent-bus down --agent-id "$ME"` stops the notifier. Add `--daemon` if you
+  started the HTTP daemon.
+- If another command fails with an auth error, check `AGENT_BUS_TOKEN_DIR`.
 
 ### 2. Weak model asks strong model
 
 ```bash
-python3 "$BUS/bus.py" find --model-tier strong
-python3 "$BUS/bus.py" ask --from "$ME" --to muse-spark --text "my concise question with file paths and context" --wait --timeout 180
+agent-bus find --model-tier strong
+agent-bus ask --from "$ME" --to muse-spark --text "my concise question with file paths and context" --wait --timeout 180
 ```
 
 Output contract for `ask --wait`: audit events go to stderr (and `bus_audit.log`); the result JSON goes to stdout. An answer row's `payload` is itself JSON-encoded, so parse `.answer.payload` a second time to get `.text`. The `status` field is a point-in-time snapshot, not a promise. Set `--idempotency-key <unique>` on any retried send or ask; keys are scoped per sender, so two agents can reuse the same key without colliding. Cross-machine asks preserve a correlation id through the handoff, so `ask --wait` and stale notices still match a remote answer.
@@ -75,8 +106,8 @@ A waiting sender sees the answer twice: once on `ask --wait` stdout, once as a n
 If I receive a bus message and need to respond:
 
 ```bash
-python3 "$BUS/bus.py" thread --agent-id "$ME" <thread-id>
-python3 "$BUS/bus.py" answer --thread-id <thread-id> --from "$ME" --to <other> --text "..."
+agent-bus thread --agent-id "$ME" <thread-id>
+agent-bus answer --thread-id <thread-id> --from "$ME" --to <other> --text "..."
 ```
 
 The asker continues the same thread with `send --thread-id <thread-id> --from "$ME" --to <other> --text "..."`. Always pass explicit `--to` on `answer`: without it the bus routes to the most recent other participant (starter fallback), which misdelivers on threads you started yourself.
@@ -88,13 +119,13 @@ A received ask will have `thread` in the `[bus:...]` prefix.
 Keep in-band message under 4 KB when practical and attach longer content:
 
 ```bash
-python3 "$BUS/bus.py" send --from "$ME" --to cat-jam --text "here is the draft" --attachment /absolute/path/file1.txt,/absolute/path/file2.md
+agent-bus send --from "$ME" --to cat-jam --text "here is the draft" --attachment /absolute/path/file1.txt,/absolute/path/file2.md
 ```
 
 Local delivery passes file paths (zero transfer code). Cross-machine send normalizes files to a content-addressed blob manifest. Cross-machine pull can materialize with:
 
 ```bash
-python3 "$BUS/bus.py" blob get --sha256 <sha256> --output /local/path
+agent-bus blob get --sha256 <sha256> --output /local/path
 ```
 
 ### 5. Recovery from bus errors
@@ -103,17 +134,17 @@ Group send gates are not HTTP statuses: each is a JSON object printed to **stder
 
 - `{"error":"must confirm latest message first","latest_seq":N,"last_read_seq":M,"last_digest_seq":K,"digest_health_hint":"..."}`:
   - The gate compares your **self-reported** `last_read_seq` against `latest_seq`. The notifier's digest path advances `last_digest_seq` only, never `last_read_seq`, so a notifier that has digested everything up to latest is still blocked; `digest_health_hint` says exactly that (`digest path is healthy, only a manual read catch-up is missing`). A member's very first send after joining is always blocked this way.
-  - `bus.py group messages --group-id <g> --agent-id <me>` and take `.latest_seq` from the response. The `messages` array can be empty when you are already caught up — `latest_seq` is still correct.
-  - `bus.py group read --group-id <g> --agent-id <me> --seq <latest_seq>`. A seq above latest is rejected (`error: invalid seq N, latest is M`), so never hardcode or guess it.
+  - `agent-bus group messages --group-id <g> --agent-id <me>` and take `.latest_seq` from the response. The `messages` array can be empty when you are already caught up — `latest_seq` is still correct.
+  - `agent-bus group read --group-id <g> --agent-id <me> --seq <latest_seq>`. A seq above latest is rejected (`error: invalid seq N, latest is M`), so never hardcode or guess it.
   - If the call reported `"truncated":true` there is more unread than it returned: read to `.served_through_seq`, call `group messages` again, repeat until `truncated` is false. `group read` refuses to ack past what it served you (see the cursor block below).
   - resend. A successful `group send` advances your own `last_read_seq` to your own new seq, so back-to-back sends by you alone do not re-arm the gate; it fires only when someone else posted since your last read or send.
 - `{"error":"rate limited","retry_after_seconds":N}`:
   - per-member, per-group send spacing; default 2s. Honor `retry_after_seconds`, then retry.
   - Set it per member with `group join --rate-seconds <s>` (group default from `group create --rate-seconds`). `0` is honored as zero, not as unset.
 - Dead or expired messages:
-  - `bus.py dlq list`
-  - `bus.py dlq retry --message-id <id>`
-  - or `bus.py dlq discard --message-id <id>`
+  - `agent-bus dlq list`
+  - `agent-bus dlq retry --message-id <id>`
+  - or `agent-bus dlq discard --message-id <id>`
   - All three need an operator identity: pass `--agent-id <you>` or export `AGENT_BUS_AGENT`. `dlq retry` now resets `expires_at`, so the requeued message survives the next sweep.
 - Verification trap after upgrading digest code: a restarted notifier whose cursor already equals latest emits no new rows, so fresh group traffic is required to exercise the new path; zero new rows right after restart means no traffic, not a broken fix.
 
@@ -122,11 +153,11 @@ Queued sends are stored, not synchronous-network. A running notifier flushes up 
 ### 6. Group chat
 
 ```bash
-python3 "$BUS/bus.py" group create --from "$ME" --group-id demo-group --topic "shared problem"
-python3 "$BUS/bus.py" group join --group-id demo-group --agent-id muse-spark
-python3 "$BUS/bus.py" group send --from "$ME" --group-id demo-group --text "..."
-python3 "$BUS/bus.py" group messages --group-id demo-group --agent-id "$ME"
-python3 "$BUS/bus.py" group read --group-id demo-group --agent-id "$ME" --seq <n>
+agent-bus group create --from "$ME" --group-id demo-group --topic "shared problem"
+agent-bus group join --group-id demo-group --agent-id muse-spark
+agent-bus group send --from "$ME" --group-id demo-group --text "..."
+agent-bus group messages --group-id demo-group --agent-id "$ME"
+agent-bus group read --group-id demo-group --agent-id "$ME" --seq <n>
 ```
 
 Three cursors per member live in `group_read_state` and never write each other:
@@ -167,12 +198,13 @@ The CLI is universal. The adapter determines how delivery happens:
 
 Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes and pulls full text via `bus message show` for 1-1 pointers, or for `group-digest-*` pointers (message show resolves them for active members, owner row or bounded reconstruction; `bus group messages` remains fallback) (text never crosses a shell). The listener is unbounded (mkdir lock plus pid/heartbeat, no AGENT_BUS_WAKE_LIMIT); it is hooked on both Stop and UserPromptSubmit (timeout 3600) so coverage spans turn boundaries and the start of each turn (measured keepalive 1s, 104s, 381s, 473s; arrival-to-wake stays ~2s). Coverage is near-continuous but not continuous: while a wake is being handled there is no live listener, so messages arriving then wait for the next hook event.
 
-Official generic watcher invocation (`bus_agent.py` is the watcher; your hook handles one message, no custom loop):
+Official generic watcher invocation (`agent-bus up` owns the watcher; your
+hook handles one message, no custom loop):
 
 ```bash
 export AGENT_NOTIFY_CMD='printf "%s %s %s\\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
-export BUS=/Users/chen/Developer/agent-bus
-python3 "$BUS/bus_agent.py" --agent-id "$ME" --adapter command --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" --poll 1
+agent-bus up --agent-id "$ME" --agent-type cursor --adapter command \
+  --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" --poll 1
 ```
 
 Recognized placeholders: `{message_id}`, `{thread_id}`, `{from_agent}`, `{agent_id}`, `{session_id}`, `{text}`.
@@ -181,7 +213,7 @@ Pointer-first is the safe default. `{text}` interpolation is disabled by default
 Ack semantics:
 - Hook exit 0 means "accepted", NOT "agent understood". Exit 0 only after durable local queueing.
 - Same trap on the push side: `acked` is a transport receipt, never comprehension. `OpencodeAdapter.inject` shells out to `session.prompt`, which returns as soon as the opencode server has taken the prompt; the model turn runs after that response. A dead or rate-limited model therefore yields exactly `status=acked`, `delivered_at == acked_at == created_at`, `retry_count=0`, `last_error=None`, and no reply. The notifier keeps heartbeating on its own loop, so `agents.status=active` is not model liveness either. The bus proves the pipe is open, not that the agent is awake. Signals that do work: an actual reply, or `ask --wait` returning stale. For opencode peers there is a direct probe the bus does not read: `api session.get --param sessionID=<id>` returns an `outcome` field (`"succeeded"` / `"failed"`) alongside `time.idle`. Observed live: the two peers that had gone silent both read `failed`, the peer still answering read `succeeded`. Semantics are opencode's, not the bus's -- treat it as a strong liveness hint, not a contract.
-- `bus.py liveness --agent-id <id>` reports this honestly instead of making you remember which adapters have a probe. For `agent_type=opencode` it returns `model_liveness` from that `outcome`; for every other adapter it returns `model_liveness:"unknown"` with `liveness_source:"none"` and a note saying why -- there is no adapter-level model probe for `command` or `tmux`, because the bus only ever sees the hook's exit code. The adapter-agnostic evidence it returns for all of them: `last_spoke_age_seconds` (last message or group post actually authored by that agent, digest rows excluded because a digest is injected *into* the agent with `from_agent` set to the agent itself), `open_asks`, and `notifier_heartbeat_age_seconds`, which proves the process, not the model. The only universal positive signal remains a round trip: an actual reply, or `ask --wait` going stale.
+- `agent-bus liveness --agent-id <id>` reports this honestly instead of making you remember which adapters have a probe. For `agent_type=opencode` it returns `model_liveness` from that `outcome`; for every other adapter it returns `model_liveness:"unknown"` with `liveness_source:"none"` and a note saying why -- there is no adapter-level model probe for `command` or `tmux`, because the bus only ever sees the hook's exit code. The adapter-agnostic evidence it returns for all of them: `last_spoke_age_seconds` (last message or group post actually authored by that agent, digest rows excluded because a digest is injected *into* the agent with `from_agent` set to the agent itself), `open_asks`, and `notifier_heartbeat_age_seconds`, which proves the process, not the model. The only universal positive signal remains a round trip: an actual reply, or `ask --wait` going stale.
 - Consequence of a successful inject into a dead session: `last_digest_seq` advances anyway, so those seqs are never re-digested when the agent comes back. `last_read_seq` does not advance, so the read gate forces the recovery: the returning agent's next send is blocked until `group read --seq <latest>`, and `group messages` is how it gets `<latest>`.
 - Hooks run under `bash -lc`. The pointer triple is the supported template; `{text}` is opt-in only because quoting a placeholder cannot reliably contain `$(...)`/backticks when the template itself adds quotes. Prefer stdin/`AGENT_BUS_*` env over interpolation entirely. Peer-supplied ids are charset-validated in the daemon as well as the CLI before they can reach a template, a tmux pane, or a pointer file.
 - Shell-expansion hazard applies to every send, not only hooks: every agent composes sends through a shell. Single-quote outbound text or write it to a file first. Corruption triage, verified live: HOLES in stored text mean outbound shell expansion (a `$...`/backtick token expanded to empty); garbled bytes mean encoding; missing head means mid-turn tmux injection. Only the third is a bus bug.
@@ -194,7 +226,7 @@ Ack semantics:
 
 If an agent lacks a direct session API, inbox files and daemon endpoints work as fallback.
 
-Production sweep owner: a running `bus_agent.py` also sweeps every 10s by default (`AGENT_BUS_SWEEP_INTERVAL`); standalone watchers must arrange `python3 bus.py sweep` every 30–60s. State is not deleted automatically: run `bus prune --agent-id <you> --days 30` (add `--dry-run` first) for retention, and rotate `bus_audit.log`/notifier logs with normal logrotate. The DB, WAL, token directory, blob directory, and audit log are created private (0600/0700); existing files are tightened on the next command.
+Production sweep owner: the notifier started by `agent-bus up` also sweeps every 10s by default (`AGENT_BUS_SWEEP_INTERVAL`); standalone watchers must arrange `agent-bus sweep` every 30–60s. State is not deleted automatically: run `bus prune --agent-id <you> --days 30` (add `--dry-run` first) for retention, and rotate `bus_audit.log`/notifier logs with normal logrotate. The DB, WAL, token directory, blob directory, and audit log are created private (0600/0700); existing files are tightened on the next command.
 
 ### Core rule
 Group digest self-exclusion: senders do not digest their own messages; the scan window (40) is wider than the 5-row render budget, and an own-only window advances the cursor to the scan end so external messages are not starved. The watch re-run must arrive with fresh traffic above the cursor.
@@ -204,20 +236,37 @@ asks expect answers: unanswered asks get up to two reminders then go stale with 
 
 If weak, discover the strong model, send a concise question with relevant file paths/digests, then wait and ack the answer. Do not write to other agents' session storage directly. Use the bus CLI.
 
-## Install (optional)
+## Install and package layout
 
-Direct script invocation remains supported, but the package can also be installed
-with the console scripts defined in `pyproject.toml`:
+The supported deployment is a venv plus the `agent-bus` console script:
 
 ```bash
-pip install -e .
-agent-bus --help
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e /path/to/agent-bus
+agent-bus --version
+agent-bus guide
+```
+
+The same `pyproject.toml` exposes lower-level entry points:
+
+```bash
 agent-bus-daemon --help
 agent-bus-notifier --help
 ```
 
+State resolution:
+
+- `AGENT_BUS_HOME` chooses the bus world explicitly.
+- A source/editable checkout keeps state in the checkout, preserving an
+  existing development bus.
+- A normal `pip install agent-bus` uses the platform user-data directory
+  (macOS: `~/Library/Application Support/agent-bus`; Linux/XDG:
+  `$XDG_DATA_HOME/agent-bus` or `~/.local/share/agent-bus`).
+- `agent-bus home` prints the resolved paths.
+
 `bus.py`, `bus_agent.py`, and `bus_daemon.py` are thin compatibility entry
-points over `buslib`.
+points over `buslib`; they are not required after installation.
 
 ### Trust boundary
 

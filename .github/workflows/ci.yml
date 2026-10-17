@@ -36,3 +36,7 @@ jobs:
         run: python3 probe_regressions.py
       - name: Process integration probe
         run: python3 probe_process.py
+      - name: Bootstrapping probe
+        run: python3 probe_up.py
+      - name: Python API probe
+        run: python3 probe_api.py

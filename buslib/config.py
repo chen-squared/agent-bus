@@ -13,7 +13,48 @@ from pathlib import Path
 from typing import Any
 
 
-BUS_HOME = Path(os.environ.get("AGENT_BUS_HOME", Path(__file__).resolve().parent.parent)).expanduser().resolve()
+def _source_checkout() -> Path | None:
+    """True only for an editable/source checkout.
+
+    A wheel install has no pyproject.toml next to the package. Keeping state in
+    the source checkout preserves the existing development/live bus, while a
+    normal `pip install agent-bus` gets a per-user state directory instead of
+    writing inside site-packages.
+    """
+    root = Path(__file__).resolve().parent.parent
+    if (root / "pyproject.toml").is_file() and (root / "buslib").is_dir():
+        return root
+    return None
+
+
+def _user_data_dir() -> Path:
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+    return (base / "agent-bus").expanduser().resolve()
+
+
+def resolve_home() -> tuple[Path, str]:
+    """Return (state directory, human-readable source).
+
+    AGENT_BUS_HOME always wins. A source checkout keeps state beside the code
+    for compatibility; an installed package uses the platform user-data
+    directory. There is deliberately no cwd fallback: the bus is meant to be
+    one stable world per machine/user, not a different bus per shell.
+    """
+    env_home = os.environ.get("AGENT_BUS_HOME")
+    if env_home:
+        return Path(env_home).expanduser().resolve(), "env:AGENT_BUS_HOME"
+    source = _source_checkout()
+    if source is not None:
+        return source, "source-checkout"
+    return _user_data_dir(), "user-data"
+
+
+BUS_HOME, HOME_SOURCE = resolve_home()
 
 
 DEFAULT_DB = str(BUS_HOME / "bus.db")
@@ -62,6 +103,42 @@ def sha256_text(text: str) -> str:
 
 
 AUDIT_LOG = Path(os.environ.get("AGENT_BUS_AUDIT_LOG", str(BUS_HOME / "bus_audit.log"))).expanduser()
+
+
+def blob_dir_path() -> Path:
+    return Path(os.environ.get("AGENT_BUS_BLOB_DIR", str(BUS_HOME / "blobs"))).expanduser().resolve()
+
+
+def run_dir() -> Path:
+    return Path(os.environ.get("AGENT_BUS_RUN_DIR", str(BUS_HOME / "run"))).expanduser().resolve()
+
+
+def log_dir() -> Path:
+    return Path(os.environ.get("AGENT_BUS_LOG_DIR", str(BUS_HOME / "logs"))).expanduser().resolve()
+
+
+def ensure_home() -> Path:
+    """Create the state directories private to the current unix user."""
+    BUS_HOME.mkdir(parents=True, exist_ok=True)
+    chmod_private(BUS_HOME, 0o700)
+    token_dir = Path(os.environ.get("AGENT_BUS_TOKEN_DIR", str(TOKEN_DIR))).expanduser()
+    for directory in (token_dir, blob_dir_path(), run_dir(), log_dir()):
+        directory.mkdir(parents=True, exist_ok=True)
+        chmod_private(directory, 0o700)
+    return BUS_HOME
+
+
+def home_info() -> dict[str, Any]:
+    return {
+        "home": str(BUS_HOME),
+        "source": HOME_SOURCE,
+        "db": str(Path(os.environ.get("AGENT_BUS_DB", DEFAULT_DB)).expanduser().resolve()),
+        "tokens": str(Path(os.environ.get("AGENT_BUS_TOKEN_DIR", str(TOKEN_DIR))).expanduser().resolve()),
+        "blobs": str(blob_dir_path()),
+        "audit_log": str(Path(os.environ.get("AGENT_BUS_AUDIT_LOG", str(AUDIT_LOG))).expanduser().resolve()),
+        "run": str(run_dir()),
+        "logs": str(log_dir()),
+    }
 
 
 def audit_log(event: str, **fields: Any) -> None:
@@ -135,18 +212,25 @@ __all__ = [
     "AUDIT_LOG",
     "BUS_HOME",
     "DEFAULT_DB",
+    "HOME_SOURCE",
     "NUDGE_FIRST_SECONDS",
     "NUDGE_STEP_SECONDS",
     "TOKEN_DIR",
     "audit_log",
+    "blob_dir_path",
     "chmod_private",
+    "ensure_home",
+    "home_info",
     "json_dumps",
     "load_token",
+    "log_dir",
     "machine_id",
     "now",
     "parse_capabilities",
     "public_agent",
+    "resolve_home",
     "row_to_dict",
+    "run_dir",
     "save_token",
     "sha256_text",
     "token_path",

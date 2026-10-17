@@ -6,11 +6,13 @@ import argparse
 import os
 from typing import Any
 
+from . import __version__
 from .agents import (
     cmd_agents, cmd_capabilities, cmd_find, cmd_heartbeat, cmd_liveness,
     cmd_register,
 )
 from .blobs import cmd_blob_gc, cmd_blob_get, cmd_blob_list, cmd_blob_put
+from .bootstrap import cmd_down, cmd_guide, cmd_home, cmd_up
 from .db import cmd_init
 from .groups import (
     cmd_group_close, cmd_group_create, cmd_group_join, cmd_group_leave,
@@ -44,11 +46,55 @@ class BusArgumentParser(argparse.ArgumentParser):
 def main() -> int:
     os.umask(0o077)
     parser = BusArgumentParser(description="agent-bus generic message bus (v0)")
+    parser.add_argument("--version", action="version", version=f"agent-bus {__version__}")
     parser.add_argument("--db", default=None, help="override database path")
     sub = parser.add_subparsers(dest="command", required=True, parser_class=BusArgumentParser)
 
     p = sub.add_parser("init", help="initialize database")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("up", help="register an agent and start its notifier in one command")
+    p.add_argument("--agent-id", default=os.environ.get("AGENT_BUS_AGENT"))
+    p.add_argument("--agent-type", help="opencode|claude-code|cursor|command|tmux (default: adapter)")
+    p.add_argument("--adapter", choices=["opencode", "tmux", "command"], default=os.environ.get("AGENT_BUS_ADAPTER", "opencode"))
+    p.add_argument("--session-id", default=os.environ.get("AGENT_BUS_SESSION"))
+    p.add_argument("--tmux-target", default=os.environ.get("TMUX_TARGET"))
+    p.add_argument("--notify-cmd", default=os.environ.get("AGENT_NOTIFY_CMD"))
+    p.add_argument("--allow-unsafe-text", action="store_true", default=os.environ.get("AGENT_BUS_ALLOW_UNSAFE_TEXT") == "1")
+    p.add_argument("--cli", default=None, help="opencode CLI path (default: autodetect)")
+    p.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD"), help="adapter working directory (default: current directory)")
+    p.add_argument("--display-name")
+    p.add_argument("--model-tier")
+    p.add_argument("--capabilities")
+    p.add_argument("--metadata")
+    p.add_argument("--endpoint")
+    p.add_argument("--machine-id")
+    p.add_argument("--poll", type=float, default=None)
+    p.add_argument("--heartbeat", type=float, default=None)
+    p.add_argument("--sweep", type=float, default=None)
+    p.add_argument("--outbox-flush", type=float, default=None)
+    p.add_argument("--daemon", action="store_true", help="also start the localhost HTTP daemon")
+    p.add_argument("--daemon-port", type=int, default=int(os.environ.get("AGENT_BUS_DAEMON_PORT", "8780")))
+    p.add_argument("--bind", default=os.environ.get("AGENT_BUS_DAEMON_BIND", "127.0.0.1"))
+    p.add_argument("--foreground", action="store_true", help="run the notifier in this process")
+    p.add_argument("--force", action="store_true", help="replace an already running notifier")
+    p.set_defaults(func=cmd_up)
+
+    p = sub.add_parser("down", help="stop an agent's notifier (and optionally its daemon)")
+    p.add_argument("--agent-id", default=os.environ.get("AGENT_BUS_AGENT"))
+    p.add_argument("--daemon", action="store_true", help="also stop the localhost HTTP daemon")
+    p.add_argument("--daemon-port", type=int, default=int(os.environ.get("AGENT_BUS_DAEMON_PORT", "8780")))
+    p.add_argument("--force", action="store_true", help="stop even if the pid's command line cannot be verified")
+    p.set_defaults(func=cmd_down)
+
+    p = sub.add_parser("home", help="show the resolved state directory and paths")
+    p.set_defaults(func=cmd_home)
+
+    p = sub.add_parser("guide", help="print an agent-oriented quickstart")
+    p.set_defaults(func=cmd_guide)
+
+    p = sub.add_parser("quickstart", help="alias for guide")
+    p.set_defaults(func=cmd_guide)
 
     p = sub.add_parser("register", help="register or update agent")
     p.add_argument("--agent-id", required=True)
@@ -296,3 +342,7 @@ __all__ = [
     "BusArgumentParser",
     "main",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
