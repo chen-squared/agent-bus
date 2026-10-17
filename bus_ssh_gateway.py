@@ -35,8 +35,9 @@ import shlex
 import subprocess
 import sys
 
-DEFAULT_DB = "/Users/chen/Developer/agent-bus/bus.db"
-DEFAULT_BUS = "/Users/chen/Developer/agent-bus/bus.py"
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB = os.path.join(HERE, "bus.db")
+DEFAULT_BUS = os.path.join(HERE, "bus.py")
 
 ALLOWED_SUBS = {"send", "read", "messages", "status"}
 
@@ -60,7 +61,8 @@ def group_flag_values(tokens: list[str]) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--identity", required=True)
     parser.add_argument("--db", default=os.environ.get("AGENT_BUS_DB", DEFAULT_DB))
     parser.add_argument("--bus", default=os.environ.get("AGENT_BUS_BUS", DEFAULT_BUS))

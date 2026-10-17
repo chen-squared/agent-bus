@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  probes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile
+        run: python3 -m compileall -q bus.py bus_agent.py bus_daemon.py bus_ssh_gateway.py probe_*.py
+      - name: Shell syntax
+        run: bash -n bus_wake.sh
+      - name: Group gates probe
+        run: python3 probe_group_gates.py
+      - name: Group digest probe
+        run: python3 probe_group_digest.py
+      - name: Security probe
+        run: python3 probe_security.py
+      - name: Review regression probe
+        run: python3 probe_regressions.py

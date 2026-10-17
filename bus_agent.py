@@ -103,9 +103,19 @@ class TmuxAdapter:
 
 
 class CommandAdapter:
-    def __init__(self, template: str, session_id: str):
+    def __init__(self, template: str, session_id: str, allow_unsafe_text: bool = False):
         self.template = template
         self.session_id = session_id
+        # {text} is interpolated into a shell command. Even shlex.quote cannot
+        # make that safe when the template itself wraps the placeholder in
+        # quotes, and a remote peer controls the text. The supported path is
+        # AGENT_BUS_TEXT / stdin; keep {text} behind an explicit opt-in.
+        if "{text}" in template and not allow_unsafe_text:
+            raise SystemExit(
+                "error: notify template contains {text}, which is shell-injection-prone; "
+                "use {message_id}/{thread_id}/{from_agent} plus $AGENT_BUS_TEXT or stdin, "
+                "or set AGENT_BUS_ALLOW_UNSAFE_TEXT=1 to accept the risk"
+            )
 
     def inject(self, message: dict[str, Any]) -> None:
         payload = json.loads(message["payload"])
@@ -139,6 +149,8 @@ def materialize_attachments(message: dict[str, Any], conn: sqlite3.Connection) -
     try:
         raw = json.loads(message.get("attachments") or "[]")
     except (json.JSONDecodeError, TypeError):
+        raw = []
+    if not isinstance(raw, list):
         raw = []
     if not raw:
         return []
@@ -338,19 +350,30 @@ def commit_group_digest(conn: sqlite3.Connection, agent_id: str, message: dict[s
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="agent-bus per-agent notifier")
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description="agent-bus per-agent notifier", allow_abbrev=False)
     parser.add_argument("--agent-id", required=True)
     parser.add_argument("--adapter", default=os.environ.get("AGENT_BUS_ADAPTER", DEFAULT_ADAPTER))
     parser.add_argument("--session-id", default=os.environ.get("AGENT_BUS_SESSION"))
     parser.add_argument("--tmux-target", default=os.environ.get("TMUX_TARGET"))
     parser.add_argument("--notify-cmd", default=os.environ.get("AGENT_NOTIFY_CMD", "printf '{message_id} {thread_id} {from_agent}\\n'"))
+    parser.add_argument(
+        "--allow-unsafe-text",
+        action="store_true",
+        default=os.environ.get("AGENT_BUS_ALLOW_UNSAFE_TEXT") == "1",
+        help="allow {text} interpolation into the shell notify template (unsafe)",
+    )
     parser.add_argument("--cli", default=os.environ.get("AGENT_BUS_CLI", DEFAULT_CLI))
-    parser.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD", "/Users/chen/Developer/agent-bus"))
+    parser.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD", str(Path(__file__).resolve().parent)))
     parser.add_argument("--poll", type=float, default=_env_float("AGENT_BUS_POLL", 1.0))
     parser.add_argument("--heartbeat", type=float, default=_env_float("AGENT_BUS_HEARTBEAT", 5.0))
+    parser.add_argument("--sweep", type=float, default=_env_float("AGENT_BUS_SWEEP_INTERVAL", 10.0))
+    parser.add_argument("--outbox-flush", type=float, default=_env_float("AGENT_BUS_OUTBOX_FLUSH", 30.0))
     args = parser.parse_args()
+    args.sweep = max(1.0, args.sweep)
 
     agent_id = args.agent_id
+    bus.validate_id("agent_id", agent_id)
     adapter_kind = args.adapter
     session_id = args.session_id
 
@@ -374,11 +397,15 @@ def main() -> int:
     elif adapter_kind == "command":
         if not args.notify_cmd:
             args.notify_cmd = "printf '{message_id} {thread_id} {from_agent}\\n'"
-        adapter = CommandAdapter(args.notify_cmd, session_id or agent_id)
+        adapter = CommandAdapter(args.notify_cmd, session_id or agent_id, args.allow_unsafe_text)
+        if args.allow_unsafe_text and "{text}" in args.notify_cmd:
+            log("warning: unsafe {text} interpolation is enabled for the notify command", agent_id)
     else:
         raise SystemExit(f"error: unknown adapter {adapter_kind}")
 
     last_heartbeat = 0.0
+    last_sweep = 0.0
+    last_outbox = 0.0
     adapter_session = getattr(adapter, "session_id", getattr(adapter, "target", ""))
     explicit_session = args.session_id is not None
     log(f"started adapter={adapter_kind} session={adapter_session}", agent_id)
@@ -406,10 +433,20 @@ def main() -> int:
                     argparse.Namespace(agent_id=agent_id, session_id=hb_session, endpoint=hb_session)
                 )
                 last_heartbeat = time.time()
-            # sweep expired and stale agents/tasks
-            bus.sweep_agents(conn)
-            bus.sweep_nudges(conn)
-            bus.sweep_expired(conn)
+            # Sweeps write; running them on every 1s poll made every notifier
+            # contend for SQLite's single writer. 10s is plenty for expiry and
+            # ask reminders, and fetch_inbox already filters expired rows.
+            if time.time() - last_sweep >= args.sweep:
+                bus.sweep_agents(conn)
+                bus.sweep_nudges(conn)
+                bus.sweep_expired(conn)
+                last_sweep = time.time()
+
+            if args.outbox_flush > 0 and time.time() - last_outbox >= args.outbox_flush:
+                sent, failed = bus.sweep_outbox(conn, limit=3, timeout=3)
+                if sent or failed:
+                    log(f"outbox flush: sent={sent} failed={failed}", agent_id)
+                last_outbox = time.time()
 
             msgs = [bus.row_to_dict(r) for r in bus.fetch_inbox(conn, agent_id, "undelivered", 25)]
 

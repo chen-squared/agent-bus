@@ -76,6 +76,43 @@ Behavior changes over the v0 above; `probe_security.py` pins each one.
   writes are atomic (temp+mv); default log moved from `/tmp/bus_wake.log` to
   `$BUS/bus_wake_<agent>.log`.
 
+## Hardening pass 2 (review fixes)
+
+`probe_regressions.py` pins each of these; `.github/workflows/ci.yml` runs all
+four probes plus compile and shell-syntax checks.
+
+- Daemon handoff applies the same id charset validation as the CLI to the
+  claimed sender, `to_agent`, and `thread_id`; a remote peer can no longer
+  inject shell metacharacters into a command-adapter template. `{text}`
+  interpolation is opt-in (`AGENT_BUS_ALLOW_UNSAFE_TEXT=1`) because quoting
+  cannot make it safe inside arbitrary templates; env/stdin is the safe path.
+- All argparse parsers disable prefix abbreviation. The SSH gateway's exact
+  `--group-id` allowlist can no longer be bypassed with `--group-i` plus a
+  duplicate flag.
+- Blob shas must be 64 lowercase hex characters at `blob_path`, blob download,
+  daemon serving, and remote attachment materialization. This closes path
+  traversal through a peer-supplied `sha256`.
+- `messages.correlation_id` survives `outbox`/handoff, so cross-machine
+  `ask --wait`, `answer`, and stale detection match the original ask. Remote
+  asks also preserve `expects_response`/`response_deadline`.
+- Idempotency keys are sender-scoped (`agent:<id>:<key>`,
+  `remote:<peer>:<key>`), preventing two agents from colliding on one key.
+  Legacy raw keys are still recognized for the same sender.
+- Running notifiers flush up to three outbox rows every 30s
+  (`AGENT_BUS_OUTBOX_FLUSH`, 0 disables); `send` no longer depends on an
+  operator running `outbox flush`.
+- `peer remove` refuses to leave orphaned outbox rows; `--force` removes them
+  explicitly. `group leave` is idempotent and reports `not_a_member`/
+  `already_left` instead of a false `left`.
+- Sweeps are throttled (`AGENT_BUS_SWEEP_INTERVAL`, default 10s) and
+  `fetch_inbox` no longer writes; `sweep_nudges` does a read-only precheck
+  before taking the write lock. This cuts idle notifier write churn.
+- `bus prune --days N` provides retention for terminal messages, outbox
+  history, and orphan deliveries. DB/WAL/token/blob/audit files are created
+  private (0600/0700) and tightened on connect.
+- `bus_wake.sh` uses the lock directory mtime when the heartbeat is missing, so
+  a just-created lock is not stolen by a concurrent watcher.
+
 ## Commands
 
 ```sh
@@ -109,6 +146,7 @@ python3 bus.py ack --agent-id <id> --message-id <id>
 
 # Maintenance
 python3 bus.py sweep
+python3 bus.py prune --days 30 --dry-run   # retention; no automatic deletion
 # dlq/peer/outbox need an operator identity: --agent-id <id> or AGENT_BUS_AGENT
 python3 bus.py dlq list
 python3 bus.py dlq retry --message-id <id>
@@ -266,8 +304,8 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
   - `GET /bus/blob/<sha256>` whole or `Range: bytes=...`
   - 206 partial content for resume.
 - Recipient notifier materializes blobs into cache and injects paths into the
-  native agent; partial failure retries and is recorded as
-  `blobs-incomplete` on eventual DLQ.
+  native agent; partial failure retries through the message retry counter and
+  lands in the DLQ with `last_error` after the retry budget.
 - Blob CLI: `bus blob put/get/list/gc`.
 - GC removes unreferenced blobs older than grace, or all with `--force`.
 - Max blob size defaults to 10 MB via `AGENT_BUS_BLOB_MAX_BYTES`.

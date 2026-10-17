@@ -21,7 +21,8 @@
 # runs `--ack` after reading. A crash before --ack redelivers on the next
 # watcher start; redelivery is the safe direction, silent loss is not.
 
-BUS="${AGENT_BUS_CLI_DIR:-/Users/chen/Developer/agent-bus}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUS="${AGENT_BUS_CLI_DIR:-$SCRIPT_DIR}"
 ME="${AGENT_BUS_AGENT:-qwen38fn}"
 # Inbox and log default to the agent's own name: setting only AGENT_BUS_AGENT
 # used to yield a watcher that reported as agent X while watching qwen38fn's
@@ -102,9 +103,15 @@ write_heartbeat() {
 }
 
 if ! mkdir "$LOCK" 2>/dev/null; then
-  hb=0
+  hb=""
   [ -f "$LOCK/heartbeat" ] && hb=$(cat "$LOCK/heartbeat" 2>/dev/null)
-  case "$hb" in ''|*[!0-9]*) hb=0 ;; esac
+  case "$hb" in ''|*[!0-9]*)
+    # A lock can be observed between mkdir and its first heartbeat write.
+    # Treat the directory mtime as the creation time instead of 1970, or a
+    # concurrent watcher would steal a lock that was created milliseconds ago.
+    hb=$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || echo 0)
+    ;;
+  esac
   age=$(( $(date +%s) - hb ))
   oldpid=$(cat "$LOCK/pid" 2>/dev/null)
   pid_alive=0
@@ -116,9 +123,12 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     # Re-check age and pid right before rm: the values above may be a moment
     # stale, and a live holder that just refreshed its heartbeat must not lose
     # its lock to a slower reclaiming watcher.
-    hb2=0
+    hb2=""
     [ -f "$LOCK/heartbeat" ] && hb2=$(cat "$LOCK/heartbeat" 2>/dev/null)
-    case "$hb2" in ''|*[!0-9]*) hb2=0 ;; esac
+    case "$hb2" in ''|*[!0-9]*)
+      hb2=$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || echo 0)
+      ;;
+    esac
     oldpid2=$(cat "$LOCK/pid" 2>/dev/null)
     alive2=0
     case "${oldpid2:-}" in
