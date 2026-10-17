@@ -76,7 +76,7 @@ Generic command adapter: you supply a one-shot hook for a single message; the
 `agent-bus up` notifier owns the polling loop, so do NOT write your own poller.
 
 ```bash
-export AGENT_NOTIFY_CMD='printf "%s %s %s\\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
+export AGENT_NOTIFY_CMD='printf "%s %s %s\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
 agent-bus up --agent-id "$ME" --agent-type cursor --adapter command \
   --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" --model-tier "$TIER"
 ```
@@ -202,7 +202,7 @@ Official generic watcher invocation (`agent-bus up` owns the watcher; your
 hook handles one message, no custom loop):
 
 ```bash
-export AGENT_NOTIFY_CMD='printf "%s %s %s\\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
+export AGENT_NOTIFY_CMD='printf "%s %s %s\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
 agent-bus up --agent-id "$ME" --agent-type cursor --adapter command \
   --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" --poll 1
 ```
