@@ -146,15 +146,22 @@ check("bob 补读到 seq1（先经 group messages 取到才生效）", rc == 0 a
 rc, out, err = cli("group", "send", "--from", "alice", "--group-id", "bp", "--text", "m3")
 check("bob 补读后放行", rc == 0, err or out)
 
-rc, out, err = cli("group", "create", "--from", "alice", "--group-id", "ceil", "--topic", "t",
+rc, out, err = cli("group", "create", "--from", "alice", "--group-id", "dead-ceil", "--topic", "t",
                    "--rate-seconds", "0", "--ceiling-per-minute", "0")
-check("create ceil 0", rc == 0, err or out)
-check("ceiling_per_minute 落库为 0（旧行为会存成 120）",
-      row("SELECT ceiling_per_minute AS v FROM groups WHERE group_id='ceil'")["v"] == 0,
+check("ceiling 0 在 create 阶段被明确拒绝", rc != 0 and "ceiling-per-minute" in err, err or out)
+check("被拒的 ceiling 0 组没有落库",
+      row("SELECT ceiling_per_minute AS v FROM groups WHERE group_id='dead-ceil'") is None)
+rc, out, err = cli("group", "create", "--from", "alice", "--group-id", "ceil", "--topic", "t",
+                   "--rate-seconds", "0", "--ceiling-per-minute", "1")
+check("create ceil 1", rc == 0, err or out)
+check("ceiling_per_minute 落库为 1",
+      row("SELECT ceiling_per_minute AS v FROM groups WHERE group_id='ceil'")["v"] == 1,
       str(row("SELECT ceiling_per_minute AS v FROM groups WHERE group_id='ceil'")))
 rc, out, err = cli("group", "send", "--from", "alice", "--group-id", "ceil", "--text", "m1")
+check("ceiling 1 的首条放行", rc == 0, err or out)
+rc, out, err = cli("group", "send", "--from", "alice", "--group-id", "ceil", "--text", "m2")
 g = gate_err(err)
-check("ceiling 0 立即拦死", rc != 0 and (g or {}).get("error") == "group ceiling reached", err or out)
+check("ceiling 1 的第二条立即拦死", rc != 0 and (g or {}).get("error") == "group ceiling reached", err or out)
 
 rc, out, err = cli("group", "create", "--from", "alice", "--group-id", "cap", "--topic", "t",
                    "--max-members", "0", "--rate-seconds", "0")

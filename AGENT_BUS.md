@@ -124,6 +124,9 @@ serving/range/auth/traversal, and background outbox flush end to end.
 - `bus prune --days N` provides retention for terminal messages, outbox
   history, and orphan deliveries. DB/WAL/token/blob/audit files are created
   private (0600/0700) and tightened on connect.
+- `group create --ceiling-per-minute 0` is rejected: the gate is
+  `recent >= ceiling`, so zero would make every future send fail. Other
+  explicit zeros keep their documented meaning.
 - `bus_wake.sh` uses the lock directory mtime when the heartbeat is missing, so
   a just-created lock is not stolen by a concurrent watcher.
 

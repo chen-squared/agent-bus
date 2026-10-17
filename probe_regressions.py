@@ -185,6 +185,9 @@ rc, out, err = cli("group", "leave", "--group-id", "leave-g", "--agent-id", "bob
 check("group leave reports left", rc == 0 and jout(out).get("status") == "left", err or out[:120])
 rc, out, err = cli("group", "leave", "--group-id", "leave-g", "--agent-id", "bob", tok=tokfile("bob"))
 check("group leave is idempotent", rc == 0 and jout(out).get("status") == "already_left", err or out[:120])
+rc, out, err = cli("group", "create", "--from", "alice", "--group-id", "dead-ceiling", "--ceiling-per-minute", "0", tok=tokfile("alice"))
+check("group create rejects a permanently unsendable ceiling", rc != 0 and "ceiling-per-minute" in err, err[:160])
+check("rejected group was not created", conn.execute("SELECT 1 FROM groups WHERE group_id='dead-ceiling'").fetchone() is None)
 
 mid = jout(cli("send", "--from", "alice", "--to", "bob", "--text", "prune me", tok=tokfile("alice"))[1]).get("message_id")
 cli("ack", "--agent-id", "bob", "--message-id", mid, tok=tokfile("bob"))

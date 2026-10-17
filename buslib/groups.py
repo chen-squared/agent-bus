@@ -30,6 +30,13 @@ def cmd_group_create(args: argparse.Namespace) -> int:
         conn.close()
         raise SystemExit("error: group create requires --owner or --from (a group without an owner cannot be closed)")
     require_auth(conn, args.owner)
+    ceiling = args.ceiling_per_minute if args.ceiling_per_minute is not None else 120
+    # The ceiling check is `recent >= ceiling`, so 0 blocks the very first send
+    # forever. A group that cannot ever send is not useful; reject it at create
+    # instead of letting the first member discover it via the send gate.
+    if ceiling <= 0:
+        conn.close()
+        raise SystemExit("error: --ceiling-per-minute must be > 0; 0 would block every group send")
     now_ts = now()
     try:
         with tx(conn):
@@ -49,7 +56,7 @@ def cmd_group_create(args: argparse.Namespace) -> int:
                     # that silently becomes a different number is worse than a rejected one.
                     (args.max_members if args.max_members is not None else 50),
                     (args.rate_seconds if args.rate_seconds is not None else 2),
-                    (args.ceiling_per_minute if args.ceiling_per_minute is not None else 120),
+                    ceiling,
                     (args.backlog_threshold if args.backlog_threshold is not None else 50),
                     "active",
                     args.owner,
