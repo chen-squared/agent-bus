@@ -19,7 +19,17 @@ from typing import Any
 
 import bus
 
-DEFAULT_CLI = "/Users/chen/Library/Application Support/ai.opencode.desktop/cli/2.0.29-arm64/opencode-cli"
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+DEFAULT_CLI = bus.resolve_opencode_cli()  # version-pinned path broke every notifier when the app updated
 DEFAULT_ADAPTER = "opencode"
 
 
@@ -32,9 +42,6 @@ class OpencodeAdapter:
         self.session_id = session_id
         self.cli = cli
         self.cwd = cwd
-
-    def target(self) -> str:
-        return self.session_id
 
     def inject(self, message: dict[str, Any]) -> None:
         payload = json.loads(message["payload"])
@@ -59,14 +66,12 @@ class TmuxAdapter:
     def __init__(self, target: str):
         self.target = target
 
-    def target_id(self) -> str:
-        return self.target
-
     def is_idle(self) -> bool:
         out = subprocess.run(
             ["tmux", "capture-pane", "-t", self.target, "-p"],
             capture_output=True,
             text=True,
+            timeout=10,
         )
         if out.returncode != 0:
             return True
@@ -76,6 +81,7 @@ class TmuxAdapter:
             ["tmux", "capture-pane", "-t", self.target, "-p"],
             capture_output=True,
             text=True,
+            timeout=10,
         )
         return out2.returncode == 0 and out2.stdout == first
 
@@ -86,10 +92,14 @@ class TmuxAdapter:
         paths = message.get("_attachment_paths") or []
         text = f"[bus:{message['message_id']} from:{message['from_agent']} thread:{message['thread_id']}] {payload.get('text','')}"
         if paths:
-            text += "\nAttachments:\n" + "\n".join(paths)
-        subprocess.run(["tmux", "send-keys", "-t", self.target, "-l", text], check=True)
+            text += " Attachments: " + " ".join(paths)
+        # send-keys -l delivers the string literally, and the trailing Enter
+        # submits it: every embedded newline would execute as its own command
+        # line in a shell pane. Flatten to a single line.
+        text = text.replace("\r", " ").replace("\n", " ")
+        subprocess.run(["tmux", "send-keys", "-t", self.target, "-l", text], check=True, timeout=10)
         time.sleep(0.1)
-        subprocess.run(["tmux", "send-keys", "-t", self.target, "Enter"], check=True)
+        subprocess.run(["tmux", "send-keys", "-t", self.target, "Enter"], check=True, timeout=10)
 
 
 class CommandAdapter:
@@ -97,13 +107,8 @@ class CommandAdapter:
         self.template = template
         self.session_id = session_id
 
-    def target_id(self) -> str:
-        return self.session_id
-
     def inject(self, message: dict[str, Any]) -> None:
         payload = json.loads(message["payload"])
-        import shlex
-
         paths = message.get("_attachment_paths") or []
         text = payload.get("text", "")
         if paths:
@@ -220,8 +225,8 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
         # would hold it open and starve everyone else's messages out of view.
         scan_to = min(g["last_digest_seq"] + 40, latest)
         rows = conn.execute(
-            "SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? AND seq>=? AND seq<=? ORDER BY seq",
-            (g["group_id"], first, scan_to),
+            "SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? AND seq>=? AND seq<=? AND (expires_at IS NULL OR expires_at > ?) ORDER BY seq",
+            (g["group_id"], first, scan_to, time.time()),
         ).fetchall()
         # My own posts are already in my context, so digesting them back to me is
         # a wake for nothing.
@@ -246,8 +251,8 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
         take = foreign[:5]
         last = take[-1]["seq"]
         pending = conn.execute(
-            "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND seq>? AND seq<=? AND sender_agent<>?",
-            (g["group_id"], g["last_digest_seq"], latest, agent_id),
+            "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND seq>? AND seq<=? AND sender_agent<>? AND (expires_at IS NULL OR expires_at > ?)",
+            (g["group_id"], g["last_digest_seq"], latest, agent_id, time.time()),
         ).fetchone()["c"]
         lines = [f"[group:{g['group_id']} topic:{g['topic']}] seq={first}-{scan_to} digest={len(take)} of {pending} unread (own posts not shown)"]
         for r in take:
@@ -316,13 +321,18 @@ def commit_group_digest(conn: sqlite3.Connection, agent_id: str, message: dict[s
             now_ts,
         ),
     )
+    # UPSERT, matching poll_group_digest's own-only branch: a bare UPDATE
+    # matched 0 rows when no group_read_state row existed, the cursor never
+    # moved, and the same digest re-injected every poll forever.
     conn.execute(
         """
-        UPDATE group_read_state
-        SET last_digest_seq=?, updated_at=?
-        WHERE group_id=? AND agent_id=?
+        INSERT INTO group_read_state (group_id,agent_id,last_digest_seq,updated_at)
+        VALUES (?,?,?,?)
+        ON CONFLICT(group_id,agent_id) DO UPDATE SET
+            last_digest_seq=excluded.last_digest_seq,
+            updated_at=excluded.updated_at
         """,
-        (message["_digest_seq"], time.time(), message["_group_id"], agent_id),
+        (message["_group_id"], agent_id, message["_digest_seq"], time.time()),
     )
     conn.commit()
 
@@ -336,8 +346,8 @@ def main() -> int:
     parser.add_argument("--notify-cmd", default=os.environ.get("AGENT_NOTIFY_CMD", "printf '{message_id} {thread_id} {from_agent}\\n'"))
     parser.add_argument("--cli", default=os.environ.get("AGENT_BUS_CLI", DEFAULT_CLI))
     parser.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD", "/Users/chen/Developer/agent-bus"))
-    parser.add_argument("--poll", type=float, default=float(os.environ.get("AGENT_BUS_POLL", "1.0")))
-    parser.add_argument("--heartbeat", type=float, default=float(os.environ.get("AGENT_BUS_HEARTBEAT", "5.0")))
+    parser.add_argument("--poll", type=float, default=_env_float("AGENT_BUS_POLL", 1.0))
+    parser.add_argument("--heartbeat", type=float, default=_env_float("AGENT_BUS_HEARTBEAT", 5.0))
     args = parser.parse_args()
 
     agent_id = args.agent_id
@@ -370,15 +380,30 @@ def main() -> int:
 
     last_heartbeat = 0.0
     adapter_session = getattr(adapter, "session_id", getattr(adapter, "target", ""))
+    explicit_session = args.session_id is not None
     log(f"started adapter={adapter_kind} session={adapter_session}", agent_id)
 
+    def safe_ack(message_id: str) -> None:
+        # bus.cmd_ack raises SystemExit (e.g. message vanished mid-flight);
+        # SystemExit is not caught by `except Exception`, so an unguarded ack
+        # used to kill the whole notifier process.
+        try:
+            bus.cmd_ack(argparse.Namespace(agent_id=agent_id, message_id=message_id))
+        except SystemExit as exc:
+            log(f"ack failed for {message_id}: {exc}", agent_id)
+
     while True:
+        conn = None
         try:
             conn = bus.connect()
             verify_token(conn, agent_id)
             if time.time() - last_heartbeat >= args.heartbeat:
+                # Heartbeat WITHOUT rebinding when --session-id was not given
+                # at start: passing the startup session every 5s used to
+                # clobber a fresh `register --session-id` forever after.
+                hb_session = session_id if explicit_session else None
                 bus.cmd_heartbeat(
-                    argparse.Namespace(agent_id=agent_id, session_id=session_id, endpoint=session_id)
+                    argparse.Namespace(agent_id=agent_id, session_id=hb_session, endpoint=hb_session)
                 )
                 last_heartbeat = time.time()
             # sweep expired and stale agents/tasks
@@ -386,19 +411,7 @@ def main() -> int:
             bus.sweep_nudges(conn)
             bus.sweep_expired(conn)
 
-            rows = bus.fetch_inbox(conn if False else None, agent_id, "undelivered", 25) if False else None
-            # direct query simpler
-            msgs = conn.execute(
-                """
-                SELECT * FROM messages
-                WHERE to_agent=? AND acked_at IS NULL
-                  AND status IN ('queued','delivered')
-                  AND (expires_at IS NULL OR expires_at > ?)
-                ORDER BY created_at ASC, message_id ASC
-                LIMIT 25
-                """,
-                (agent_id, time.time()),
-            ).fetchall()
+            msgs = [bus.row_to_dict(r) for r in bus.fetch_inbox(conn, agent_id, "undelivered", 25)]
 
             # Optional group digest (one unseen digest per poll cycle).
             try:
@@ -413,24 +426,22 @@ def main() -> int:
             except Exception as exc:
                 log(f"group digest poll error: {exc}", agent_id)
 
-            for m in msgs:
-                msg = bus.row_to_dict(m)
+            for msg in msgs:
                 if already_delivered(conn, agent_id, msg["message_id"]):
                     # Already injected earlier; just ack.
-                    bus.cmd_ack(argparse.Namespace(agent_id=agent_id, message_id=msg["message_id"]))
+                    safe_ack(msg["message_id"])
                     log(f"already delivered, re-acked {msg['message_id']}", agent_id)
                     continue
                 try:
                     materialize_attachments(msg, conn)
                     adapter.inject(msg)
                     record_delivery(conn, agent_id, msg["message_id"])
-                    # refresh session binding (in case adapter target changed)
                     conn.execute(
-                        "UPDATE messages SET status='delivered', delivered_at=COALESCE(delivered_at,?), retry_count=retry_count WHERE message_id=?",
+                        "UPDATE messages SET status='delivered', delivered_at=COALESCE(delivered_at,?) WHERE message_id=?",
                         (time.time(), msg["message_id"]),
                     )
                     conn.commit()
-                    bus.cmd_ack(argparse.Namespace(agent_id=agent_id, message_id=msg["message_id"]))
+                    safe_ack(msg["message_id"])
                     log(f"delivered+acked {msg['message_id']} from {msg['from_agent']}", agent_id)
                 except AdapterError as exc:
                     if "busy" in str(exc).lower():
@@ -461,9 +472,16 @@ def main() -> int:
                         log(f"dead-letter {msg['message_id']}: {exc}", agent_id)
                     else:
                         log(f"delivery failed {msg['message_id']}: {exc}", agent_id)
-            conn.close()
         except Exception as exc:
             log(f"poll error: {exc}", agent_id)
+        finally:
+            # conn.close() used to sit at the end of the try body: any
+            # exception between connect and there leaked the connection.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         time.sleep(args.poll)
 
 

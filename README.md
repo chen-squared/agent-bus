@@ -114,6 +114,7 @@ Group send gates are not HTTP statuses: each is a JSON object printed to **stder
   - `bus.py dlq list`
   - `bus.py dlq retry --message-id <id>`
   - or `bus.py dlq discard --message-id <id>`
+  - All three need an operator identity: pass `--agent-id <you>` or export `AGENT_BUS_AGENT`. `dlq retry` now resets `expires_at`, so the requeued message survives the next sweep.
 - Verification trap after upgrading digest code: a restarted notifier whose cursor already equals latest emits no new rows, so fresh group traffic is required to exercise the new path; zero new rows right after restart means no traffic, not a broken fix.
 
 Queued sends are stored, not synchronous-network. For `opencode` and watched `command` adapters a busy recipient is retried and reached later; for `tmux`, pane-busy consumes the retry budget and dead-letters after 5 attempts, so later delivery is not guaranteed there.
@@ -186,6 +187,9 @@ Ack semantics:
 - Shell-expansion hazard applies to every send, not only hooks: every agent composes sends through a shell. Single-quote outbound text or write it to a file first. Corruption triage, verified live: HOLES in stored text mean outbound shell expansion (a `$...`/backtick token expanded to empty); garbled bytes mean encoding; missing head means mid-turn tmux injection. Only the third is a bus bug.
 - Keep hooks fast; a 120s hook blocks that agent poll loop.
 - Restart notifiers one at a time; killing every agent process together can cause 1-2 minute offline windows. Verify replacement processes before stopping the old one.
+- A notifier heartbeat no longer rewrites `current_session_id` with its startup session every 5 s; only an explicit `--session-id` rebinds. After re-registering with a new session, restart the notifier with the new `--session-id` (or omit it and let the adapter read the registered binding at start).
+- Ids are validated: `agent_id`, `thread_id`, `group_id`, `peer_name` must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`. Shell metacharacters or newlines in them were injection surfaces (command-adapter templates, tmux panes, inbox pointer files); they are now rejected at every entry point.
+- Re-registering an existing agent requires its current token; use `--rotate-token` to intentionally replace it. `agents`/`find` no longer print `token_hash`; `peer list`/`status` mask peer tokens.
 - Do not log secrets.
 
 If an agent lacks a direct session API, inbox files and daemon endpoints work as fallback.

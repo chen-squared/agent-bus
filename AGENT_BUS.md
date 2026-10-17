@@ -28,6 +28,54 @@ transport remains available as a backup.
   matches the `--from/--agent-id` identity.
 - Future v1: Unix socket + peer credentials.
 
+## Hardening pass (2026-10-17)
+
+Behavior changes over the v0 above; `probe_security.py` pins each one.
+
+- `register` no longer overwrites an existing agent's token. Re-registering
+  requires the agent's current token; intentional rotation is `--rotate-token`
+  (also authenticated). `created_token` now reports the truth.
+- Ids are a closed charset: `agent_id`, `thread_id`, `group_id`, `peer_name`
+  match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`. This closes shell-metacharacter
+  injection through command-adapter templates, newline forgery in inbox
+  pointer files, and token-path traversal.
+- Auth added to commands that read or mutate every agent's data:
+  `group messages`, `group read`, `group status` (now `--agent-id` required,
+  authed members only) verify the acting agent's token, not just membership;
+  `dlq list/retry/discard`, `peer add/list/remove`, `outbox list/flush` need
+  an operator identity (`--agent-id` or `AGENT_BUS_AGENT`).
+- `agents`/`find` no longer print `token_hash`; `peer list`/`status` mask
+  `peers.auth_token` as `***`.
+- Multi-step writes are real transactions (`BEGIN IMMEDIATE`): group send
+  (gates + seq + cursor), group join (capacity cap), group create, ask/answer
+  (message + outbox), sweep_nudges. Concurrent group sends no longer collide
+  on `(group_id, seq)`.
+- `dlq retry` resets `expires_at`, so a requeued message survives the next
+  sweep (it used to be re-expired instantly).
+- `outbox flush` honors `max_attempts` (rows past budget become `dead`) and
+  caps each pass at 100 rows.
+- `inbox --status all` really includes acked rows (it used to filter them).
+- `ask --wait` only accepts an answer linked to the waiting ask
+  (`answer_to_message_id`) or unlinked ones; an answer to a different ask in
+  the same thread no longer satisfies the wait.
+- Notifier heartbeats no longer rewrite `current_session_id` with the startup
+  session every 5 s; only an explicit `--session-id` rebinds.
+- opencode CLI path is resolved by globbing the newest
+  `~/Library/Application Support/ai.opencode.desktop/cli/*/opencode-cli`
+  (env `AGENT_BUS_CLI` still wins); the pinned 2.0.29 path is gone.
+- Daemon handoff: the authenticated peer names the sender (`from_agent` is
+  rewritten to `<claimed-local>@<peer_name>`), `message_id` is generated
+  locally, and dedupe rides on a peer-namespaced `idempotency_key`. Body size
+  capped at 16 MB; token compare is constant-time; internal errors no longer
+  echoed to the remote caller.
+- `bus_ssh_gateway.py`: group allowlist is fail-closed (no config = no group
+  commands) and checks every `--group-id`/`--group-id=` occurrence, closing
+  the `=`-syntax and duplicate-flag bypasses. `--group` is normalized to
+  `--group-id`; pinned `--agent-id` is appended for `messages/read/status`.
+- `bus_wake.sh`: lock reclaim requires stale heartbeat AND dead pid; heartbeat
+  writes are atomic (temp+mv); default log moved from `/tmp/bus_wake.log` to
+  `$BUS/bus_wake_<agent>.log`.
+
 ## Commands
 
 ```sh
@@ -61,6 +109,7 @@ python3 bus.py ack --agent-id <id> --message-id <id>
 
 # Maintenance
 python3 bus.py sweep
+# dlq/peer/outbox need an operator identity: --agent-id <id> or AGENT_BUS_AGENT
 python3 bus.py dlq list
 python3 bus.py dlq retry --message-id <id>
 python3 bus.py dlq discard --message-id <id>
@@ -262,9 +311,13 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
 
 Test status: local three-party drill passed (read gate, rate gate, ceiling, backpressure, digest).
 Reproducible coverage lives in `probe_group_digest.py` (digest self-exclusion, cursor
-invariants, leave auth, token-namespace isolation) and `probe_group_gates.py` (join
+invariants, leave auth, token-namespace isolation), `probe_group_gates.py` (join
 `--role` rejection, explicit-zero flags, gate error shapes, and the 60-unread paging
-case where `read --seq <latest>` must clamp to 50 instead of burning seqs 51-60); both
+case where `read --seq <latest>` must clamp to 50 instead of burning seqs 51-60), and
+`probe_security.py` (register credential protection, auth on data-exposing commands,
+id charset rejection, dlq retry expiry reset, peer token masking, outbox max_attempts,
+ask/answer idempotency, 8-way concurrent group send, heartbeat non-rebinding, gateway
+allowlist bypasses, daemon importability, 1:1 send/inbox/ack smoke); all three
 drive the real CLI against a throwaway DB and token dir and must stay green.
 For non-opencode agents, use `command` adapter as the blessed generic watcher; tmux remains final fallback.
 

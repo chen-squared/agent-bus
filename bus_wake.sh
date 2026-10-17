@@ -21,15 +21,25 @@
 # runs `--ack` after reading. A crash before --ack redelivers on the next
 # watcher start; redelivery is the safe direction, silent loss is not.
 
-INBOX="${AGENT_BUS_INBOX:-/Users/chen/Developer/agent-bus/.bus_inbox_qwen38fn.txt}"
+BUS="${AGENT_BUS_CLI_DIR:-/Users/chen/Developer/agent-bus}"
+ME="${AGENT_BUS_AGENT:-qwen38fn}"
+# Inbox and log default to the agent's own name: setting only AGENT_BUS_AGENT
+# used to yield a watcher that reported as agent X while watching qwen38fn's
+# inbox.
+INBOX="${AGENT_BUS_INBOX:-$BUS/.bus_inbox_${ME}.txt}"
 PROCESSING="$INBOX.processing"
 LOCK="$INBOX.lock"
 BATCH="${AGENT_BUS_WAKE_BATCH:-5}"
-BUS="${AGENT_BUS_CLI_DIR:-/Users/chen/Developer/agent-bus}"
-ME="${AGENT_BUS_AGENT:-qwen38fn}"
-WLOG="${AGENT_BUS_WAKE_LOG:-/tmp/bus_wake.log}"
+# Workspace-local, per-agent log: /tmp/bus_wake.log was world-writable,
+# predictable, agent-agnostic, and openable without O_EXCL.
+WLOG="${AGENT_BUS_WAKE_LOG:-$BUS/bus_wake_${ME}.log}"
 BEAT="${AGENT_BUS_WAKE_BEAT:-600}"        # liveness log cadence, seconds
 STALE="${AGENT_BUS_LOCK_STALE:-30}"      # lock heartbeat age that counts as dead
+
+if [ -z "$INBOX" ]; then
+  echo "bus_wake: AGENT_BUS_INBOX is empty; refusing to build lock paths from it" >&2
+  exit 1
+fi
 
 # --- explicit consumption ack ----------------------------------------------
 if [ "${1:-}" = "--ack" ]; then
@@ -80,17 +90,49 @@ report_and_wake() {
 # A killed watcher can leak the lock; without recovery every later watcher
 # exits 0 and the wake path fails silently. pid liveness alone is not enough
 # because pids get reused, so staleness is judged on the heartbeat timestamp.
+# Reclaim requires BOTH conditions: a stale heartbeat AND a dead (or absent)
+# pid. The old code rm -rf'd on heartbeat age alone, which lost races two ways:
+# a second watcher could delete a freshly reclaimed lock, and a heartbeat read
+# landing mid-write returned "" -> hb=0 -> "stale" -> a LIVE lock was stolen.
+write_heartbeat() {
+  # Atomic: write to a temp file and mv, so a concurrent reader never sees a
+  # truncated (empty) heartbeat.
+  local tmp="$LOCK/.hb.$$"
+  date +%s > "$tmp" && mv "$tmp" "$LOCK/heartbeat"
+}
+
 if ! mkdir "$LOCK" 2>/dev/null; then
   hb=0
   [ -f "$LOCK/heartbeat" ] && hb=$(cat "$LOCK/heartbeat" 2>/dev/null)
   case "$hb" in ''|*[!0-9]*) hb=0 ;; esac
   age=$(( $(date +%s) - hb ))
   oldpid=$(cat "$LOCK/pid" 2>/dev/null)
-  if [ "$age" -gt "$STALE" ]; then
-    rm -rf "$LOCK"
-    if mkdir "$LOCK" 2>/dev/null; then
-      printf '%s watcher reclaimed stale lock (pid %s, heartbeat %ss old)\n' \
-        "$(date '+%H:%M:%S')" "${oldpid:-?}" "$age" >> "$WLOG"
+  pid_alive=0
+  case "${oldpid:-}" in
+    ''|*[!0-9]*) ;;  # no usable pid recorded
+    *) kill -0 "$oldpid" 2>/dev/null && pid_alive=1 ;;
+  esac
+  if [ "$age" -gt "$STALE" ] && [ "$pid_alive" -eq 0 ]; then
+    # Re-check age and pid right before rm: the values above may be a moment
+    # stale, and a live holder that just refreshed its heartbeat must not lose
+    # its lock to a slower reclaiming watcher.
+    hb2=0
+    [ -f "$LOCK/heartbeat" ] && hb2=$(cat "$LOCK/heartbeat" 2>/dev/null)
+    case "$hb2" in ''|*[!0-9]*) hb2=0 ;; esac
+    oldpid2=$(cat "$LOCK/pid" 2>/dev/null)
+    alive2=0
+    case "${oldpid2:-}" in
+      ''|*[!0-9]*) ;;
+      *) kill -0 "$oldpid2" 2>/dev/null && alive2=1 ;;
+    esac
+    if [ $(( $(date +%s) - hb2 )) -gt "$STALE" ] && [ "$alive2" -eq 0 ]; then
+      rm -rf "$LOCK"
+      if mkdir "$LOCK" 2>/dev/null; then
+        printf '%s watcher reclaimed stale lock (pid %s, heartbeat %ss old)\n' \
+          "$(date '+%H:%M:%S')" "${oldpid2:-?}" "$age" >> "$WLOG"
+      else
+        exit 0
+      fi
     else
       exit 0
     fi
@@ -99,7 +141,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   fi
 fi
 echo $$ > "$LOCK/pid"
-date +%s > "$LOCK/heartbeat"
+write_heartbeat
 trap 'rm -rf "$LOCK" 2>/dev/null' EXIT
 trap 'exit 143' INT TERM HUP
 
@@ -117,7 +159,7 @@ fi
 
 i=0
 while :; do
-  date +%s > "$LOCK/heartbeat"
+  write_heartbeat
 
   if [ -s "$INBOX" ]; then
     # Atomic handoff: mv aside so a concurrent `printf >> inbox` from the
@@ -130,7 +172,7 @@ while :; do
     report_and_wake "$PROCESSING" "$i"
   fi
 
-  if [ "$i" -gt 0 ] && [ $((i % BEAT)) -eq 0 ]; then
+  if [ "$i" -gt 0 ] && [ "$BEAT" -gt 0 ] && [ $((i % BEAT)) -eq 0 ]; then
     printf '%s watcher alive after %ss listening\n' "$(date '+%H:%M:%S')" "$i" >> "$WLOG"
   fi
   sleep 1

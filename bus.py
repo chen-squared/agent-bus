@@ -8,6 +8,7 @@ runs its own notifier (`bus_agent.py`) which polls the shared database.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -189,7 +190,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
 
     if "machine_id" not in columns("agents"):
         conn.execute("ALTER TABLE agents ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'unknown'")
-    conn.execute("UPDATE agents SET machine_id=COALESCE(NULLIF(machine_id,'unknown'),?)", (machine_id(),))
+    # Only fill in unknown machine_ids, and only when any exist: this runs on
+    # every connect(), and an unconditional UPDATE took a write lock on every
+    # read-only command and every notifier poll tick.
+    if conn.execute("SELECT 1 FROM agents WHERE machine_id IS NULL OR machine_id='unknown' OR machine_id=''").fetchone():
+        conn.execute("UPDATE agents SET machine_id=? WHERE machine_id IS NULL OR machine_id='unknown' OR machine_id=''", (machine_id(),))
     if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='group_read_state'").fetchone():
         for col, ddl in (
             ("last_digest_seq", "ALTER TABLE group_read_state ADD COLUMN last_digest_seq INTEGER NOT NULL DEFAULT 0"),
@@ -255,7 +260,11 @@ def load_token(agent_id: str) -> str | None:
 def save_token(agent_id: str, token: str) -> Path:
     p = token_path(agent_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(token + "\n")
+    # Create with the final mode directly: write_text+chmod leaves the file at
+    # umask perms (0644) for a brief window.
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(token + "\n")
     os.chmod(p, 0o600)
     return p
 
@@ -301,10 +310,53 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {k: row[k] for k in row.keys()}
 
 
-def participants_arg(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [x.strip() for x in value.split(",") if x.strip()]
+# Ids reach shells (command-adapter templates, tmux send-keys, inbox pointer
+# files) and file names (tokens/<agent>.token). A shell metacharacter or a
+# newline in any of them is an injection or a line-forgery, so ids are a
+# closed charset, checked once at every entry point that accepts one.
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def validate_id(kind: str, value: str | None) -> None:
+    if value is None:
+        return
+    if not ID_RE.fullmatch(value):
+        raise SystemExit(
+            f"error: invalid {kind} {value!r}; allowed: letters, digits, '_', '.', '-' (max 64, no shell metacharacters or newlines)"
+        )
+
+
+@contextlib.contextmanager
+def tx(conn: sqlite3.Connection):
+    """Explicit transaction. connect() is autocommit (isolation_level=None),
+    so the old conn.commit() calls were no-ops and every multi-step write
+    (gate check -> seq -> insert -> cursor) was its own transaction.
+    BEGIN IMMEDIATE takes the write lock up front, which is what makes the
+    group seq assignment and the join cap race-free across processes."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def require_operator_auth(conn: sqlite3.Connection, agent_id: str | None) -> str:
+    """Maintenance commands (dlq/peer/outbox) read or mutate every agent's
+    data, so they need a proven identity even though they act on behalf of
+    the operator rather than one agent."""
+    agent_id = agent_id or os.environ.get("AGENT_BUS_AGENT")
+    if not agent_id:
+        raise SystemExit("error: this command needs an operator identity: pass --agent-id or set AGENT_BUS_AGENT")
+    return require_auth(conn, agent_id)
+
+
+def public_agent(item: dict[str, Any]) -> dict[str, Any]:
+    """Agent rows are printed by `agents`/`find`, which are discovery commands
+    with no auth. token_hash must never ride along."""
+    item.pop("token_hash", None)
+    return item
 
 
 def blob_dir() -> Path:
@@ -450,7 +502,7 @@ def cmd_blob_gc(args: argparse.Namespace) -> int:
     referenced = iter_referenced_blob_hashes()
     root = blob_dir()
     root.mkdir(parents=True, exist_ok=True)
-    grace = args.grace_seconds or 86400
+    grace = args.grace_seconds if args.grace_seconds is not None else 86400  # `or 86400` swallowed --grace-seconds 0
     removed = 0
     kept = 0
     removed_bytes = 0
@@ -477,16 +529,33 @@ def cmd_init(_args: argparse.Namespace) -> int:
 
 
 def cmd_register(args: argparse.Namespace) -> int:
+    validate_id("agent_id", args.agent_id)
     conn = connect()
     preexisting = conn.execute(
         "SELECT token_hash FROM agents WHERE agent_id=?", (args.agent_id,)
     ).fetchone()
-    token = None
-    if preexisting is None:
-        token = load_token(args.agent_id)
-    if token is None:
+    token = load_token(args.agent_id)
+    created_token = False
+    if preexisting is not None:
+        # Re-registering used to mint a fresh token unconditionally and
+        # overwrite both tokens/<id>.token and the stored token_hash. Any
+        # local process could then take over any agent id AND invalidate the
+        # real holder's credential. A re-register must present the current
+        # token; deliberate rotation is an explicit, also-authenticated flag.
+        if token is None or sha256_text(token) != preexisting["token_hash"]:
+            conn.close()
+            raise SystemExit(
+                f"error: agent {args.agent_id!r} already exists; re-registering requires its current token "
+                f"(expected at {token_path(args.agent_id)}). Use --rotate-token to intentionally replace it."
+            )
+        if args.rotate_token:
+            token = secrets.token_urlsafe(32)
+            save_token(args.agent_id, token)
+            created_token = True
+    elif token is None:
         token = secrets.token_urlsafe(32)
         save_token(args.agent_id, token)
+        created_token = True
     token_hash = sha256_text(token)
     capabilities = parse_capabilities(args.capabilities)
     metadata = {}
@@ -542,7 +611,7 @@ def cmd_register(args: argparse.Namespace) -> int:
                 "ok": True,
                 "agent_id": args.agent_id,
                 "token_file": str(token_path(args.agent_id)),
-                "created_token": token is not None,
+                "created_token": created_token,
             }
         )
     )
@@ -577,17 +646,19 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
 
 
 def ensure_thread(conn: sqlite3.Connection, thread_id: str, created_by: str | None, participants: list[str]) -> None:
-    existing = conn.execute("SELECT 1 FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
-    if existing is None:
-        conn.execute(
-            "INSERT INTO threads(thread_id,participants,created_by,created_at,status) VALUES (?,?,?,?,?)",
-            (thread_id, json_dumps(participants), created_by, now(), "open"),
-        )
-    elif participants:
-        row = conn.execute("SELECT participants FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
-        old = set(json.loads(row["participants"] or "[]"))
+    # INSERT OR IGNORE: the old check-then-insert raced two processes that
+    # both started the same fresh thread_id, and the loser died with an
+    # uncaught IntegrityError traceback.
+    conn.execute(
+        "INSERT OR IGNORE INTO threads(thread_id,participants,created_by,created_at,status) VALUES (?,?,?,?,?)",
+        (thread_id, json_dumps(participants), created_by, now(), "open"),
+    )
+    existing = conn.execute("SELECT participants FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
+    if participants and existing is not None:
+        old = set(json.loads(existing["participants"] or "[]"))
         merged = sorted(old | set(participants))
-        conn.execute("UPDATE threads SET participants=? WHERE thread_id=?", (json_dumps(merged), thread_id))
+        if merged != old:
+            conn.execute("UPDATE threads SET participants=? WHERE thread_id=?", (json_dumps(merged), thread_id))
 
 
 def cmd_message_show(args: argparse.Namespace) -> int:
@@ -666,10 +737,10 @@ def cmd_thread(args: argparse.Namespace) -> int:
     # Group thread fallback: if thread participants are coarse and a group
     # owns the messages in this thread, use current group members on the home.
     if not participants:
-        group_rows = {
-            r["group_id"]
-            for r in conn.execute("SELECT DISTINCT group_id FROM group_messages WHERE thread_id=? OR thread_id IS NULL", ()).fetchall()
-        }
+        # (Old code queried group_messages.thread_id, a column that does not
+        # exist, and discarded the result: an empty-participants thread crashed
+        # with OperationalError instead of falling through to the involvement
+        # check below.)
         pass
     if args.agent_id not in participants:
         # Allow access if this agent is the sender or original recipient of any
@@ -719,8 +790,10 @@ def cmd_send(args: argparse.Namespace) -> int:
         conn.close()
         raise SystemExit("error: message text must not be empty")
     ttl = args.ttl
-    expires = now_ts + ttl if ttl else None
+    # `if ttl` swallowed --ttl 0 into "no expiry"; an explicit 0 is explicit.
+    expires = now_ts + ttl if ttl is not None else None
     thread_id = args.thread_id or str(uuid.uuid4())
+    validate_id("thread_id", args.thread_id)
     ensure_thread(conn, thread_id, args.from_agent, [args.from_agent, args.to_agent])
     attachments = []
     if args.attachment:
@@ -754,7 +827,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                 attachments.append(manifest)
     text_bytes = len(args.text.encode("utf-8"))
     if text_bytes > 64 * 1024:
-        print("error: message text exceeds 64KB", file=sys.stderr)
+        conn.close()
         raise SystemExit("error: message text exceeds 64KB")
     soft_warning = "text exceeds 4KB soft cap; consider attachments" if text_bytes > 4 * 1024 else None
     if soft_warning:
@@ -774,63 +847,63 @@ def cmd_send(args: argparse.Namespace) -> int:
             print(json_dumps({"ok": True, "duplicate": True, "message_id": found["message_id"], "thread_id": found["thread_id"]}))
             return 0
     message_id = str(uuid.uuid4())
+    outbox_id = str(uuid.uuid4())
     attached = attachments
     message_type = args.message_type or "text"
-    if message_type == "ask":
-        message_type = "ask"
     try:
-        conn.execute(
-            """
-            INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
-                payload,attachments,ttl_seconds,expires_at,retry_count,status,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                message_id,
-                thread_id,
-                args.idempotency_key,
-                args.from_agent,
-                args.to_agent,
-                message_type,
-                args.urgency or "normal",
-                json_dumps(payload),
-                json_dumps(attached),
-                ttl,
-                expires,
-                0,
-                "queued",
-                now_ts,
-            ),
-        )
+        # One transaction: message row + its outbox handoff entry land
+        # together, so a crash cannot leave a remote send with no outbox row.
+        with tx(conn):
+            conn.execute(
+                """
+                INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
+                    payload,attachments,ttl_seconds,expires_at,retry_count,status,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    message_id,
+                    thread_id,
+                    args.idempotency_key,
+                    args.from_agent,
+                    args.to_agent,
+                    message_type,
+                    args.urgency or "normal",
+                    json_dumps(payload),
+                    json_dumps(attached),
+                    ttl,
+                    expires,
+                    0,
+                    "queued",
+                    now_ts,
+                ),
+            )
+            if remote_peer is not None:
+                row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO outbox (outbox_id,peer_name,message_id,from_agent,to_remote,thread_id,payload,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        outbox_id,
+                        remote_peer,
+                        message_id,
+                        args.from_agent,
+                        args.to_agent,
+                        thread_id,
+                        json_dumps(row_to_dict(row)),
+                        "pending",
+                        now(),
+                        now(),
+                    ),
+                )
     except sqlite3.IntegrityError as exc:
-        conn.rollback()
         conn.close()
         raise SystemExit(f"error: insert failed: {exc}")
-    conn.commit()
     audit_log("send", from_agent=args.from_agent, to_agent=args.to_agent, message_id=message_id, thread_id=thread_id)
     remote_result = None
     if remote_peer is not None:
         row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
-        outbox_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO outbox (outbox_id,peer_name,message_id,from_agent,to_remote,thread_id,payload,status,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                outbox_id,
-                remote_peer,
-                message_id,
-                args.from_agent,
-                args.to_agent,
-                thread_id,
-                json_dumps(row_to_dict(row)),
-                "pending",
-                now(),
-                now(),
-            ),
-        )
-        conn.commit()
         peer = conn.execute("SELECT * FROM peers WHERE peer_name=?", (remote_peer,)).fetchone()
         ok, receipt = _handoff_peer(row_to_dict(peer), row_to_dict(row), timeout=10)
         new_status = "sent" if ok else "failed"
@@ -838,7 +911,6 @@ def cmd_send(args: argparse.Namespace) -> int:
             "UPDATE outbox SET status=?, receipt=?, attempts=attempts+1, last_error=?, updated_at=?, delivered_at=? WHERE outbox_id=?",
             (new_status, receipt, None if ok else str(receipt)[:500], now(), now() if ok else None, outbox_id),
         )
-        conn.commit()
         remote_result = {"outbox_id": outbox_id, "handoff": "ok" if ok else "failed", "receipt": receipt}
     payload = {"ok": True, "message_id": message_id, "thread_id": thread_id, "to": args.to_agent, "type": message_type, "target_stale": target_stale}
     if soft_warning:
@@ -857,7 +929,9 @@ def fetch_inbox(conn: sqlite3.Connection, agent_id: str, status: str | None, lim
     params: list[Any] = [agent_id]
     if status == "undelivered":
         sql += " AND status IN ('queued','delivered') AND acked_at IS NULL"
-    elif status and status != "all":
+    elif status == "all":
+        pass  # "all" used to add `acked_at IS NULL`, silently hiding acked rows.
+    elif status:
         sql += " AND status=?"
         params.append(status)
     else:
@@ -904,7 +978,7 @@ def cmd_agents(args: argparse.Namespace) -> int:
     ts = now()
     items = []
     for r in rows:
-        item = row_to_dict(r)
+        item = public_agent(row_to_dict(r))
         item["stale"] = is_stale(r, ts)
         item["heartbeat_age_seconds"] = (ts - float(r["last_heartbeat"])) if r["last_heartbeat"] else None
         items.append(item)
@@ -913,10 +987,22 @@ def cmd_agents(args: argparse.Namespace) -> int:
     return 0
 
 
-OPENCODE_CLI = os.environ.get(
-    "AGENT_BUS_CLI",
-    "/Users/chen/Library/Application Support/ai.opencode.desktop/cli/2.0.29-arm64/opencode-cli",
-)
+def resolve_opencode_cli() -> str:
+    """Pick the opencode CLI without hardcoding a version: a pinned
+    `.../cli/2.0.29-arm64/opencode-cli` kept working silently broken the day
+    the app updated to 2.0.31 and every notifier failed its next inject."""
+    env = os.environ.get("AGENT_BUS_CLI")
+    if env:
+        return env
+    base = Path.home() / "Library" / "Application Support" / "ai.opencode.desktop" / "cli"
+    if base.is_dir():
+        for cand in sorted(base.glob("*/opencode-cli"), reverse=True):
+            if cand.exists() and os.access(cand, os.X_OK):
+                return str(cand)
+    return "opencode"  # fall back to whatever is on PATH
+
+
+OPENCODE_CLI = resolve_opencode_cli()
 
 
 def _opencode_outcome(session_id: str) -> dict[str, Any]:
@@ -1038,19 +1124,6 @@ def cmd_sweep(_args: argparse.Namespace) -> int:
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    ns = argparse.Namespace(
-        from_agent=args.from_agent,
-        to_agent=args.to_agent,
-        text=args.text,
-        thread_id=args.thread_id,
-        message_type="ask",
-        urgency=args.urgency or "normal",
-        ttl=args.ttl if args.ttl is not None else 300,
-        idempotency_key=args.idempotency_key,
-        attachment=args.attachment,
-        metadata=args.metadata,
-    )
-    # Reuse send logic by calling internal
     conn = connect()
     require_auth(conn, args.from_agent)
     remote_peer = None
@@ -1065,6 +1138,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         require_agent(conn, args.to_agent)
     now_ts = now()
     thread_id = args.thread_id or str(uuid.uuid4())
+    validate_id("thread_id", args.thread_id)
     ensure_thread(conn, thread_id, args.from_agent, [args.from_agent, args.to_agent])
     attachments = []
     if args.attachment:
@@ -1098,71 +1172,83 @@ def cmd_ask(args: argparse.Namespace) -> int:
     expires = now_ts + ttl
     expect_reply = bool(not getattr(args, "no_expect_reply", False))
     response_deadline = now_ts + NUDGE_FIRST_SECONDS if expect_reply else None
+    if args.idempotency_key:
+        found = conn.execute(
+            "SELECT message_id,thread_id FROM messages WHERE idempotency_key=?", (args.idempotency_key,)
+        ).fetchone()
+        if found is not None:
+            conn.close()
+            print(json_dumps({"ok": True, "duplicate": True, "message_id": found["message_id"], "thread_id": found["thread_id"]}))
+            return 0
     message_id = str(uuid.uuid4())
+    outbox_id = str(uuid.uuid4())
     payload = {"text": args.text, "kind": "ask"}
     if args.metadata:
         try:
             payload["metadata"] = json.loads(args.metadata)
         except json.JSONDecodeError:
             payload["metadata"] = {"note": args.metadata}
-    conn.execute(
-        """
-        INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
-            payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,retry_count,status,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            message_id,
-            thread_id,
-            args.idempotency_key,
-            args.from_agent,
-            args.to_agent,
-            "ask",
-            args.urgency or "normal",
-            json_dumps(payload),
-            json_dumps(attachments),
-            ttl,
-            expires,
-            1 if expect_reply else 0,
-            response_deadline,
-            0,
-            0,
-            "queued",
-            now_ts,
-        ),
-    )
-    conn.commit()
+    try:
+        with tx(conn):
+            conn.execute(
+                """
+                INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
+                    payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,retry_count,status,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    message_id,
+                    thread_id,
+                    args.idempotency_key,
+                    args.from_agent,
+                    args.to_agent,
+                    "ask",
+                    args.urgency or "normal",
+                    json_dumps(payload),
+                    json_dumps(attachments),
+                    ttl,
+                    expires,
+                    1 if expect_reply else 0,
+                    response_deadline,
+                    0,
+                    0,
+                    "queued",
+                    now_ts,
+                ),
+            )
+            if remote_peer is not None:
+                row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO outbox (outbox_id,peer_name,message_id,from_agent,to_remote,thread_id,payload,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        outbox_id,
+                        remote_peer,
+                        message_id,
+                        args.from_agent,
+                        args.to_agent,
+                        thread_id,
+                        json_dumps(row_to_dict(row)),
+                        "pending",
+                        now(),
+                        now(),
+                    ),
+                )
+    except sqlite3.IntegrityError as exc:
+        conn.close()
+        raise SystemExit(f"error: insert failed: {exc}")
     audit_log("send", from_agent=args.from_agent, to_agent=args.to_agent, message_id=message_id, thread_id=thread_id)
     remote_result = None
     if remote_peer is not None:
         row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
-        outbox_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO outbox (outbox_id,peer_name,message_id,from_agent,to_remote,thread_id,payload,status,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                outbox_id,
-                remote_peer,
-                message_id,
-                args.from_agent,
-                args.to_agent,
-                thread_id,
-                json_dumps(row_to_dict(row)),
-                "pending",
-                now(),
-                now(),
-            ),
-        )
-        conn.commit()
         peer = conn.execute("SELECT * FROM peers WHERE peer_name=?", (remote_peer,)).fetchone()
         ok, receipt = _handoff_peer(row_to_dict(peer), row_to_dict(row), timeout=10)
         conn.execute(
             "UPDATE outbox SET status=?, receipt=?, attempts=attempts+1, last_error=?, updated_at=?, delivered_at=? WHERE outbox_id=?",
             ("sent" if ok else "failed", receipt, None if ok else str(receipt)[:500], now(), now() if ok else None, outbox_id),
         )
-        conn.commit()
         remote_result = {"outbox_id": outbox_id, "handoff": "ok" if ok else "failed", "receipt": receipt}
     result = {"ok": True, "message_id": message_id, "thread_id": thread_id, "to": args.to_agent, "type": "ask"}
     if soft_warning:
@@ -1173,7 +1259,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         print(json_dumps(result))
         conn.close()
         return 0
-    timeout = args.timeout or 120
+    timeout = args.timeout if args.timeout is not None else 120  # `or 120` swallowed --timeout 0
     deadline = time.time() + timeout
     answer_row = None
     stale = False
@@ -1188,9 +1274,10 @@ def cmd_ask(args: argparse.Namespace) -> int:
             """
             SELECT * FROM messages
             WHERE thread_id=? AND message_type='answer' AND from_agent=? AND created_at >= ?
+              AND (answer_to_message_id=? OR answer_to_message_id IS NULL)
             ORDER BY created_at ASC LIMIT 1
             """,
-            (thread_id, args.to_agent, now_ts),
+            (thread_id, args.to_agent, now_ts, message_id),
         ).fetchall()
         if rows:
             answer_row = rows[0]
@@ -1244,7 +1331,16 @@ def cmd_answer(args: argparse.Namespace) -> int:
     now_ts = now()
     ttl = args.ttl if args.ttl is not None else 300
     expires = now_ts + ttl
+    if args.idempotency_key:
+        found = conn.execute(
+            "SELECT message_id,thread_id FROM messages WHERE idempotency_key=?", (args.idempotency_key,)
+        ).fetchone()
+        if found is not None:
+            conn.close()
+            print(json_dumps({"ok": True, "duplicate": True, "message_id": found["message_id"], "thread_id": found["thread_id"]}))
+            return 0
     message_id = str(uuid.uuid4())
+    outbox_id = str(uuid.uuid4())
     payload = {"text": args.text, "kind": "answer"}
     if args.metadata:
         try:
@@ -1258,55 +1354,59 @@ def cmd_answer(args: argparse.Namespace) -> int:
             (args.thread_id,),
         ).fetchone()
         answer_to = row["message_id"] if row else None
-    conn.execute(
-        """
-        INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
-            payload,attachments,ttl_seconds,expires_at,retry_count,status,answer_to_message_id,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            message_id,
-            args.thread_id,
-            args.idempotency_key,
-            args.from_agent,
-            to,
-            "answer",
-            args.urgency or "normal",
-            json_dumps(payload),
-            "[]",
-            ttl,
-            expires,
-            0,
-            "queued",
-            answer_to,
-            now_ts,
-        ),
-    )
-    conn.commit()
+    try:
+        with tx(conn):
+            conn.execute(
+                """
+                INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
+                    payload,attachments,ttl_seconds,expires_at,retry_count,status,answer_to_message_id,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    message_id,
+                    args.thread_id,
+                    args.idempotency_key,
+                    args.from_agent,
+                    to,
+                    "answer",
+                    args.urgency or "normal",
+                    json_dumps(payload),
+                    "[]",
+                    ttl,
+                    expires,
+                    0,
+                    "queued",
+                    answer_to,
+                    now_ts,
+                ),
+            )
+            if remote_peer is not None:
+                row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO outbox (outbox_id,peer_name,message_id,from_agent,to_remote,thread_id,payload,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        outbox_id,
+                        remote_peer,
+                        message_id,
+                        args.from_agent,
+                        to,
+                        args.thread_id,
+                        json_dumps(row_to_dict(row)),
+                        "pending",
+                        now(),
+                        now(),
+                    ),
+                )
+    except sqlite3.IntegrityError as exc:
+        conn.close()
+        raise SystemExit(f"error: insert failed: {exc}")
     audit_log("send", from_agent=args.from_agent, to_agent=args.to_agent, message_id=message_id, thread_id=args.thread_id)
     remote_result = None
     if remote_peer is not None:
         row = conn.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
-        outbox_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO outbox (outbox_id,peer_name,message_id,from_agent,to_remote,thread_id,payload,status,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                outbox_id,
-                remote_peer,
-                message_id,
-                args.from_agent,
-                to,
-                args.thread_id,
-                json_dumps(row_to_dict(row)),
-                "pending",
-                now(),
-                now(),
-            ),
-        )
-        conn.commit()
         peer = conn.execute("SELECT * FROM peers WHERE peer_name=?", (remote_peer,)).fetchone()
         ok, receipt = _handoff_peer(row_to_dict(peer), row_to_dict(row), timeout=10)
         new_status = "sent" if ok else "failed"
@@ -1314,7 +1414,6 @@ def cmd_answer(args: argparse.Namespace) -> int:
             "UPDATE outbox SET status=?, receipt=?, attempts=attempts+1, last_error=?, updated_at=?, delivered_at=? WHERE outbox_id=?",
             (new_status, receipt, None if ok else str(receipt)[:500], now(), now() if ok else None, outbox_id),
         )
-        conn.commit()
         remote_result = {"outbox_id": outbox_id, "handoff": "ok" if ok else "failed", "receipt": receipt}
     payload = {"ok": True, "message_id": message_id, "thread_id": args.thread_id, "to": to, "type": "answer"}
     if remote_result:
@@ -1356,9 +1455,6 @@ HEARTBEAT_EXPIRY = float(os.environ.get("AGENT_BUS_HEARTBEAT_EXPIRY", "30"))
 def is_stale(row: sqlite3.Row | None, now_ts: float | None = None) -> bool:
     if row is None:
         return True
-    if row["status"] in {"dead", "stale"}:
-        # active agents can revive; stale marker itself counts stale.
-        pass
     ts = now_ts or now()
     last = row["last_heartbeat"]
     if last is None:
@@ -1389,7 +1485,7 @@ def cmd_find(args: argparse.Namespace) -> int:
             continue
         if args.active_only and is_stale(r, ts):
             continue
-        item = row_to_dict(r)
+        item = public_agent(row_to_dict(r))
         item["stale"] = is_stale(r, ts)
         item["heartbeat_age_seconds"] = (ts - float(r["last_heartbeat"])) if r["last_heartbeat"] else None
         result.append(item)
@@ -1400,6 +1496,9 @@ def cmd_find(args: argparse.Namespace) -> int:
 
 def cmd_dlq_list(args: argparse.Namespace) -> int:
     conn = connect()
+    # dlq list prints every agent's dead/expired payloads; retry and discard
+    # mutate arbitrary message rows. All three now need a proven identity.
+    require_operator_auth(conn, getattr(args, "agent_id", None))
     status_clause = "status IN ('dead','expired')"
     params: list[Any] = []
     if args.status:
@@ -1417,25 +1516,33 @@ def cmd_dlq_list(args: argparse.Namespace) -> int:
 
 def cmd_dlq_retry(args: argparse.Namespace) -> int:
     conn = connect()
-    row = conn.execute("SELECT status FROM messages WHERE message_id=?", (args.message_id,)).fetchone()
+    require_operator_auth(conn, getattr(args, "agent_id", None))
+    row = conn.execute("SELECT status,expires_at,ttl_seconds FROM messages WHERE message_id=?", (args.message_id,)).fetchone()
     if row is None:
         conn.close()
         raise SystemExit(f"error: message {args.message_id} not found")
     if row["status"] not in {"dead", "expired"}:
         conn.close()
         raise SystemExit(f"error: message is {row['status']}, only dead/expired can retry")
+    # Requeueing an expired message used to leave expires_at in the past, so
+    # the next sweep_expired re-expired it immediately: the retry was a no-op.
+    # A message that had no TTL stays TTL-free; one that did gets its ttl back.
+    new_expires = None
+    if row["expires_at"] is not None:
+        ttl_back = row["ttl_seconds"] if row["ttl_seconds"] and row["ttl_seconds"] > 0 else 86400
+        new_expires = now() + ttl_back
     conn.execute(
-        "UPDATE messages SET status='queued', retry_count=0, last_error=NULL WHERE message_id=?",
-        (args.message_id,),
+        "UPDATE messages SET status='queued', retry_count=0, last_error=NULL, expires_at=? WHERE message_id=?",
+        (new_expires, args.message_id),
     )
-    conn.commit()
-    print(json_dumps({"ok": True, "message_id": args.message_id, "status": "queued"}))
+    print(json_dumps({"ok": True, "message_id": args.message_id, "status": "queued", "expires_at": new_expires}))
     conn.close()
     return 0
 
 
 def cmd_dlq_discard(args: argparse.Namespace) -> int:
     conn = connect()
+    require_operator_auth(conn, getattr(args, "agent_id", None))
     row = conn.execute("SELECT status FROM messages WHERE message_id=?", (args.message_id,)).fetchone()
     if row is None:
         conn.close()
@@ -1444,14 +1551,24 @@ def cmd_dlq_discard(args: argparse.Namespace) -> int:
         conn.close()
         raise SystemExit(f"error: message is {row['status']}; ack or cancel it instead")
     conn.execute("DELETE FROM messages WHERE message_id=?", (args.message_id,))
-    conn.commit()
+    audit_log("dlq_discard", agent_id=getattr(args, "agent_id", None), message_id=args.message_id)
     print(json_dumps({"ok": True, "message_id": args.message_id, "discarded": True}))
     conn.close()
     return 0
 
 
+def mask_peer(row: dict[str, Any]) -> dict[str, Any]:
+    # peers.auth_token is stored plaintext; it must never be echoed by
+    # `peer list` or `status`, and --token on argv already lands in ps.
+    if "auth_token" in row:
+        row["auth_token"] = "***" if row["auth_token"] else None
+    return row
+
+
 def cmd_peer_add(args: argparse.Namespace) -> int:
+    validate_id("peer_name", args.peer)
     conn = connect()
+    require_operator_auth(conn, getattr(args, "agent_id", None))
     try:
         conn.execute(
             """
@@ -1484,18 +1601,20 @@ def cmd_peer_add(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_peer_list(_args: argparse.Namespace) -> int:
+def cmd_peer_list(args: argparse.Namespace) -> int:
     conn = connect()
+    require_operator_auth(conn, getattr(args, "agent_id", None))
     rows = conn.execute("SELECT * FROM peers ORDER BY peer_name").fetchall()
-    print(json_dumps({"ok": True, "peers": [row_to_dict(r) for r in rows]}))
+    print(json_dumps({"ok": True, "peers": [mask_peer(row_to_dict(r)) for r in rows]}))
     conn.close()
     return 0
 
 
 def cmd_peer_remove(args: argparse.Namespace) -> int:
     conn = connect()
+    require_operator_auth(conn, getattr(args, "agent_id", None))
     conn.execute("DELETE FROM peers WHERE peer_name=?", (args.peer,))
-    conn.commit()
+    audit_log("peer_remove", peer_name=args.peer)
     print(json_dumps({"ok": True, "removed": args.peer}))
     conn.close()
     return 0
@@ -1517,7 +1636,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 "inactive_peers": [r["peer_name"] for r in peers if r["status"] not in {"ok", "configured"}],
                 "outbox": {r["status"]: r["c"] for r in outbox},
                 "dlq_depth": dlq["c"] if dlq else 0,
-                "peers": [row_to_dict(r) for r in peers],
+                "peers": [mask_peer(row_to_dict(r)) for r in peers],
             }
         )
     )
@@ -1527,6 +1646,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 def cmd_outbox_list(args: argparse.Namespace) -> int:
     conn = connect()
+    require_operator_auth(conn, getattr(args, "agent_id", None))
     rows = conn.execute(
         "SELECT * FROM outbox ORDER BY created_at DESC LIMIT ?", (args.limit,)
     ).fetchall()
@@ -1562,9 +1682,22 @@ def _handoff_peer(peer, message_row: dict[str, Any], timeout: int = 10) -> tuple
 
 def cmd_outbox_flush(args: argparse.Namespace) -> int:
     conn = connect()
+    require_operator_auth(conn, getattr(args, "agent_id", None))
+    # outbox.max_attempts was declared and never read: a permanently dead peer
+    # was retried forever, one 10s HTTP timeout at a time, with no LIMIT on the
+    # backlog either. Rows past their attempt budget are given up on.
     rows = conn.execute(
-        "SELECT o.*, p.base_url, p.auth_token, p.peer_name AS pname FROM outbox o JOIN peers p ON o.peer_name=p.peer_name WHERE o.status IN ('pending','failed') ORDER BY o.created_at"
+        """
+        SELECT o.*, p.base_url, p.auth_token, p.peer_name AS pname FROM outbox o
+        JOIN peers p ON o.peer_name=p.peer_name
+        WHERE o.status IN ('pending','failed') AND o.attempts < o.max_attempts
+        ORDER BY o.created_at LIMIT 100
+        """
     ).fetchall()
+    given_up = conn.execute(
+        "UPDATE outbox SET status='dead', updated_at=? WHERE status IN ('pending','failed') AND attempts>=max_attempts",
+        (now(),),
+    ).rowcount
     flushed = 0
     failed = 0
     for row in rows:
@@ -1574,7 +1707,7 @@ def cmd_outbox_flush(args: argparse.Namespace) -> int:
             "auth_token": row["auth_token"],
         }
         message_row = json.loads(row["payload"])
-        ok, receipt = _handoff_peer(peer, message_row, timeout=args.timeout or 10)
+        ok, receipt = _handoff_peer(peer, message_row, timeout=args.timeout if args.timeout is not None else 10)
         if ok:
             conn.execute(
                 "UPDATE outbox SET status='sent', attempts=attempts+1, receipt=?, updated_at=?, delivered_at=? WHERE outbox_id=?",
@@ -1587,10 +1720,9 @@ def cmd_outbox_flush(args: argparse.Namespace) -> int:
                 (str(receipt)[:500], now(), row["outbox_id"]),
             )
             failed += 1
-    conn.commit()
-    print(json_dumps({"ok": True, "flushed": flushed, "failed": failed}))
+    print(json_dumps({"ok": True, "flushed": flushed, "failed": failed, "given_up": given_up}))
     conn.close()
-    return 0
+    return 0 if failed == 0 else 1
 
 
 def _group_require_member(conn: sqlite3.Connection, group_id: str, agent_id: str) -> sqlite3.Row:
@@ -1603,36 +1735,41 @@ def _group_require_member(conn: sqlite3.Connection, group_id: str, agent_id: str
 
 
 def cmd_group_create(args: argparse.Namespace) -> int:
+    validate_id("group_id", args.group_id)
     conn = connect()
     if not args.owner:
         args.owner = args.from_agent if args.from_agent else None
+    if not args.owner:
+        conn.close()
+        raise SystemExit("error: group create requires --owner or --from (a group without an owner cannot be closed)")
+    require_auth(conn, args.owner)
     now_ts = now()
     try:
-        conn.execute(
-            """
-            INSERT INTO groups (group_id,topic,home_machine,mode,max_members,rate_seconds,ceiling_per_minute,
-                backlog_threshold,status,created_by,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                args.group_id,
-                args.topic,
-                machine_id(),
-                args.mode or "catch-up-gated",
-                # `or` here swallowed explicit zeros: --backlog-threshold 0 stored 50,
-                # --ceiling-per-minute 0 stored 120, --max-members 0 stored 50. A flag
-                # that silently becomes a different number is worse than a rejected one.
-                (args.max_members if args.max_members is not None else 50),
-                (args.rate_seconds if args.rate_seconds is not None else 2),
-                (args.ceiling_per_minute if args.ceiling_per_minute is not None else 120),
-                (args.backlog_threshold if args.backlog_threshold is not None else 50),
-                "active",
-                args.owner,
-                now_ts,
-                now_ts,
-            ),
-        )
-        if args.owner:
+        with tx(conn):
+            conn.execute(
+                """
+                INSERT INTO groups (group_id,topic,home_machine,mode,max_members,rate_seconds,ceiling_per_minute,
+                    backlog_threshold,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    args.group_id,
+                    args.topic,
+                    machine_id(),
+                    args.mode or "catch-up-gated",
+                    # `or` here swallowed explicit zeros: --backlog-threshold 0 stored 50,
+                    # --ceiling-per-minute 0 stored 120, --max-members 0 stored 50. A flag
+                    # that silently becomes a different number is worse than a rejected one.
+                    (args.max_members if args.max_members is not None else 50),
+                    (args.rate_seconds if args.rate_seconds is not None else 2),
+                    (args.ceiling_per_minute if args.ceiling_per_minute is not None else 120),
+                    (args.backlog_threshold if args.backlog_threshold is not None else 50),
+                    "active",
+                    args.owner,
+                    now_ts,
+                    now_ts,
+                ),
+            )
             conn.execute(
                 "INSERT INTO group_members (group_id,agent_id,role,rate_seconds,joined_at,status) VALUES (?,?,?,?,?,?)",
                 (args.group_id, args.owner, "owner", (args.rate_seconds if args.rate_seconds is not None else 2), now_ts, "active"),
@@ -1644,13 +1781,13 @@ def cmd_group_create(args: argparse.Namespace) -> int:
     except sqlite3.IntegrityError as exc:
         conn.close()
         raise SystemExit(f"error: create group failed: {exc}")
-    conn.commit()
     print(json_dumps({"ok": True, "group_id": args.group_id, "home_machine": machine_id()}))
     conn.close()
     return 0
 
 
 def cmd_group_join(args: argparse.Namespace) -> int:
+    validate_id("group_id", args.group_id)
     conn = connect()
     require_auth(conn, args.agent_id)
     group = conn.execute("SELECT * FROM groups WHERE group_id=?", (args.group_id,)).fetchone()
@@ -1660,10 +1797,6 @@ def cmd_group_join(args: argparse.Namespace) -> int:
     if group["status"] != "active":
         conn.close()
         raise SystemExit(f"error: group {args.group_id} is {group['status']}")
-    count = conn.execute("SELECT COUNT(*) AS c FROM group_members WHERE group_id=? AND status='active'", (args.group_id,)).fetchone()["c"]
-    if count >= group["max_members"]:
-        conn.close()
-        raise SystemExit(f"error: group {args.group_id} is full")
     # --role used to be accepted here and then dropped on the floor: the INSERT
     # below writes "member" unconditionally, so `--role owner` landed a member and
     # reported ok. A silently ignored privilege flag is worse than a rejected one,
@@ -1677,28 +1810,38 @@ def cmd_group_join(args: argparse.Namespace) -> int:
         )
     rate = (args.rate_seconds if args.rate_seconds is not None else (group["rate_seconds"] if group["rate_seconds"] is not None else 2))
     now_ts = now()
-    conn.execute(
-        """
-        INSERT INTO group_members (group_id,agent_id,role,rate_seconds,joined_at,status)
-        VALUES (?,?,?,?,?,?)
-        ON CONFLICT(group_id,agent_id) DO UPDATE SET
-            status='active',
-            rate_seconds=excluded.rate_seconds,
-            joined_at=excluded.joined_at
-        """,
-        (args.group_id, args.agent_id, "member", rate, now_ts, "active"),
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO group_read_state (group_id,agent_id,last_read_seq,updated_at) VALUES (?,?,?,?)",
-        (args.group_id, args.agent_id, 0, now_ts),
-    )
-    conn.commit()
+    # The capacity check and the two inserts are one transaction: the old
+    # COUNT-then-INSERT allowed two concurrent joins to both pass the cap.
+    with tx(conn):
+        count = conn.execute("SELECT COUNT(*) AS c FROM group_members WHERE group_id=? AND status='active'", (args.group_id,)).fetchone()["c"]
+        already = conn.execute("SELECT status FROM group_members WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id)).fetchone()
+        if count >= group["max_members"] and (already is None or already["status"] != "active"):
+            # No conn.close() here: the tx context manager rolls back first,
+            # and closing inside would make the rollback raise and mask the error.
+            raise SystemExit(f"error: group {args.group_id} is full")
+        conn.execute(
+            """
+            INSERT INTO group_members (group_id,agent_id,role,rate_seconds,joined_at,status)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(group_id,agent_id) DO UPDATE SET
+                status='active',
+                rate_seconds=excluded.rate_seconds,
+                joined_at=excluded.joined_at
+            """,
+            (args.group_id, args.agent_id, "member", rate, now_ts, "active"),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO group_read_state (group_id,agent_id,last_read_seq,updated_at) VALUES (?,?,?,?)",
+            (args.group_id, args.agent_id, 0, now_ts),
+        )
+    audit_log("group_join", group_id=args.group_id, agent_id=args.agent_id)
     print(json_dumps({"ok": True, "group_id": args.group_id, "agent_id": args.agent_id}))
     conn.close()
     return 0
 
 
 def cmd_group_leave(args: argparse.Namespace) -> int:
+    validate_id("group_id", args.group_id)
     conn = connect()
     # Without this any same-user agent could leave on someone else's behalf,
     # which deletes that member's read_state row and resets their digest cursor
@@ -1706,12 +1849,13 @@ def cmd_group_leave(args: argparse.Namespace) -> int:
     require_auth(conn, args.agent_id)
     conn.execute("UPDATE group_members SET status='left' WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id))
     conn.execute("DELETE FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id))
-    conn.commit()
+    audit_log("group_leave", group_id=args.group_id, agent_id=args.agent_id)
     print(json_dumps({"ok": True, "group_id": args.group_id, "agent_id": args.agent_id, "status": "left"}))
     conn.close()
     return 0
 
 def cmd_group_close(args: argparse.Namespace) -> int:
+    validate_id("group_id", args.group_id)
     conn = connect()
     require_auth(conn, args.agent_id)
     if conn.execute("SELECT 1 FROM groups WHERE group_id=?", (args.group_id,)).fetchone() is None:
@@ -1751,23 +1895,34 @@ def cmd_group_list(args: argparse.Namespace) -> int:
 
 
 def cmd_group_messages(args: argparse.Namespace) -> int:
+    validate_id("group_id", args.group_id)
     conn = connect()
     if conn.execute("SELECT 1 FROM groups WHERE group_id=?", (args.group_id,)).fetchone() is None:
         conn.close()
         raise SystemExit(f"error: unknown group {args.group_id}")
     if args.agent_id:
+        # Membership alone was guessable: group_id + agent_id are not secrets,
+        # and this call both reads the member's entire unread history and moves
+        # their last_served_seq cursor. It now requires the member's token.
+        require_auth(conn, args.agent_id)
         _group_require_member(conn, args.group_id, args.agent_id)
         state = conn.execute("SELECT last_read_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.agent_id)).fetchone()
         since = state["last_read_seq"] if state else 0
         # Explicit 0 means "counters only, no rows" -- same falsiness rule as the
         # other numeric group flags, where `or 50` rewrote a configured 0.
         limit = args.limit if args.limit is not None else 50
+        if limit < 0:
+            conn.close()
+            raise SystemExit("error: --limit cannot be negative (SQLite reads LIMIT -1 as no limit)")
+        # group_messages.expires_at was written but never enforced anywhere.
+        live = "AND (expires_at IS NULL OR expires_at > ?)"
+        ts = now()
         unread_total = conn.execute(
-            "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND seq>?", (args.group_id, since)
+            f"SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND seq>? {live}", (args.group_id, since, ts)
         ).fetchone()["c"]
         rows = conn.execute(
-            "SELECT * FROM group_messages WHERE group_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
-            (args.group_id, since, limit),
+            f"SELECT * FROM group_messages WHERE group_id=? AND seq>? {live} ORDER BY seq ASC LIMIT ?",
+            (args.group_id, since, ts, limit),
         ).fetchall()
     else:
         conn.close()
@@ -1780,6 +1935,10 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
     # this. The notifier digest path deliberately never writes it -- a digest is not
     # a receipt for a gap the caller chose to acknowledge.
     served_through = rows[-1]["seq"] if rows else 0
+    if not rows and unread_total == 0:
+        # Nothing live remains above `since`: any leftover seqs are expired and
+        # gone, so acknowledging through latest is honest, not a gap.
+        served_through = max(served_through, latest)
     if served_through:
         conn.execute(
             """
@@ -1790,7 +1949,6 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
             """,
             (args.group_id, args.agent_id, served_through, now()),
         )
-        conn.commit()
     truncated = unread_total > len(rows)
     if truncated:
         span = f"seq {rows[0]['seq']}-{served_through}" if rows else "no rows at all"
@@ -1810,7 +1968,12 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
 
 
 def cmd_group_read(args: argparse.Namespace) -> int:
+    validate_id("group_id", args.group_id)
     conn = connect()
+    # Same reasoning as group messages: this moves the member's last_read_seq,
+    # i.e. it disarms the read gate on their behalf. Guessing group_id+agent_id
+    # must not be enough.
+    require_auth(conn, args.agent_id)
     _group_require_member(conn, args.group_id, args.agent_id)
     latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
     requested = args.seq if args.seq is not None else latest
@@ -1871,6 +2034,7 @@ def cmd_group_read(args: argparse.Namespace) -> int:
 
 
 def cmd_group_send(args: argparse.Namespace) -> int:
+    validate_id("group_id", args.group_id)
     conn = connect()
     require_auth(conn, args.from_agent)
     group = conn.execute("SELECT * FROM groups WHERE group_id=?", (args.group_id,)).fetchone()
@@ -1882,31 +2046,9 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         raise SystemExit(f"error: group {args.group_id} is {group['status']}")
     member = _group_require_member(conn, args.group_id, args.from_agent)
     now_ts = now()
-    latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
-    read_state = conn.execute("SELECT last_read_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.from_agent)).fetchone()
-    last_read = read_state["last_read_seq"] if read_state else 0
-    digest_state = conn.execute(
-        "SELECT last_digest_seq FROM group_read_state WHERE group_id=? AND agent_id=?",
-        (args.group_id, args.from_agent),
-    ).fetchone()
-    last_digest = digest_state["last_digest_seq"] if digest_state and digest_state["last_digest_seq"] is not None else 0
-    if latest > 0 and last_read < latest:
-        conn.close()
-        raise SystemExit(
-            json_dumps(
-                {
-                    "error": "must confirm latest message first",
-                    "latest_seq": latest,
-                    "last_read_seq": last_read,
-                    "last_digest_seq": last_digest,
-                    "digest_health_hint": (
-                        "caught-up messages may still be unprocessed by your notifier"
-                        if last_digest < latest
-                        else "digest path is healthy, only a manual read catch-up is missing"
-                    ),
-                }
-            )
-        )
+    # Input validation runs BEFORE the gates: a blank message to a group you
+    # have not caught up on used to report "must confirm latest message first"
+    # instead of "text must not be empty".
     if not (args.text or "").strip():
         conn.close()
         raise SystemExit("error: group message text must not be empty")
@@ -1914,39 +2056,70 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     if text_bytes > 64 * 1024:
         conn.close()
         raise SystemExit("error: message text exceeds 64KB")
-    if text_bytes > 1024 * 1024:
-        pass
-    rate = (member["rate_seconds"] if member["rate_seconds"] is not None else (group["rate_seconds"] if group["rate_seconds"] is not None else 2))
-    if member["last_sent_at"] and (now_ts - float(member["last_sent_at"])) < rate:
-        wait = round(rate - (now_ts - float(member["last_sent_at"])), 3)
-        conn.close()
-        raise SystemExit(json_dumps({"error": "rate limited", "retry_after_seconds": wait}))
-    # Same falsiness rule as cmd_group_create: a stored 0 means 0, not the default.
-    ceiling = group["ceiling_per_minute"] if group["ceiling_per_minute"] is not None else 120
-    recent = conn.execute(
-        "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND created_at>?",
-        (args.group_id, now_ts - 60),
-    ).fetchone()["c"]
-    if recent >= ceiling:
-        conn.close()
-        raise SystemExit(json_dumps({"error": "group ceiling reached", "retry_after_seconds": 5}))
-    backlog = conn.execute(
-        """
-        SELECT COUNT(*) AS c FROM group_read_state grs
-        JOIN group_members gm ON gm.group_id=grs.group_id AND gm.agent_id=grs.agent_id
-        WHERE grs.group_id=? AND gm.status='active' AND grs.last_read_seq < ?
-        """,
-        (args.group_id, latest),
-    ).fetchone()["c"]
-    if backlog > (group["backlog_threshold"] if group["backlog_threshold"] is not None else 50):
-        conn.close()
-        raise SystemExit(json_dumps({"error": "group backpressure: too many unread participants"}))
-    next_seq = latest + 1
-    expires = now_ts + args.ttl if args.ttl else None
+    soft_warning = "text exceeds 4KB soft cap; consider attachments" if text_bytes > 4 * 1024 else None
     message_id = str(uuid.uuid4())
     payload = {"text": args.text}
-    soft_warning = "text exceeds 4KB soft cap; consider attachments" if text_bytes > 4 * 1024 else None
-    try:
+    # Gates, seq assignment, insert and cursor bump are ONE transaction.
+    # BEGIN IMMEDIATE serializes concurrent senders: the second sender reads a
+    # fresh latest after the first commits, so the old MAX(seq)+1 TOCTOU (both
+    # computed the same seq, the loser got `error: insert failed`) is gone,
+    # and the ceiling/rate gates are evaluated under the same lock they guard.
+    with tx(conn):
+        latest = conn.execute("SELECT COALESCE(MAX(seq),0) AS seq FROM group_messages WHERE group_id=?", (args.group_id,)).fetchone()["seq"]
+        read_state = conn.execute("SELECT last_read_seq FROM group_read_state WHERE group_id=? AND agent_id=?", (args.group_id, args.from_agent)).fetchone()
+        last_read = read_state["last_read_seq"] if read_state else 0
+        digest_state = conn.execute(
+            "SELECT last_digest_seq FROM group_read_state WHERE group_id=? AND agent_id=?",
+            (args.group_id, args.from_agent),
+        ).fetchone()
+        last_digest = digest_state["last_digest_seq"] if digest_state and digest_state["last_digest_seq"] is not None else 0
+        if latest > 0 and last_read < latest:
+            raise SystemExit(
+                json_dumps(
+                    {
+                        "error": "must confirm latest message first",
+                        "latest_seq": latest,
+                        "last_read_seq": last_read,
+                        "last_digest_seq": last_digest,
+                        "digest_health_hint": (
+                            "caught-up messages may still be unprocessed by your notifier"
+                            if last_digest < latest
+                            else "digest path is healthy, only a manual read catch-up is missing"
+                        ),
+                    }
+                )
+            )
+        # Re-read the member row under the write lock: the pre-tx read could
+        # be stale against a concurrent send by the same member.
+        member = conn.execute("SELECT * FROM group_members WHERE group_id=? AND agent_id=?", (args.group_id, args.from_agent)).fetchone()
+        rate = (member["rate_seconds"] if member["rate_seconds"] is not None else (group["rate_seconds"] if group["rate_seconds"] is not None else 2))
+        # rate > 0 guard: now_ts is captured before BEGIN IMMEDIATE, so after
+        # waiting on the write lock dt can be negative, and a negative dt
+        # would trip `dt < 0` on a rate-0 member. A zero rate means no gate.
+        if rate > 0 and member["last_sent_at"] and (now_ts - float(member["last_sent_at"])) < rate:
+            wait = round(rate - (now_ts - float(member["last_sent_at"])), 3)
+            raise SystemExit(json_dumps({"error": "rate limited", "retry_after_seconds": wait}))
+        # Same falsiness rule as cmd_group_create: a stored 0 means 0, not the default.
+        ceiling = group["ceiling_per_minute"] if group["ceiling_per_minute"] is not None else 120
+        recent = conn.execute(
+            "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND created_at>?",
+            (args.group_id, now_ts - 60),
+        ).fetchone()["c"]
+        if recent >= ceiling:
+            raise SystemExit(json_dumps({"error": "group ceiling reached", "retry_after_seconds": 5}))
+        backlog = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM group_read_state grs
+            JOIN group_members gm ON gm.group_id=grs.group_id AND gm.agent_id=grs.agent_id
+            WHERE grs.group_id=? AND gm.status='active' AND grs.last_read_seq < ?
+            """,
+            (args.group_id, latest),
+        ).fetchone()["c"]
+        if backlog > (group["backlog_threshold"] if group["backlog_threshold"] is not None else 50):
+            raise SystemExit(json_dumps({"error": "group backpressure: too many unread participants"}))
+        next_seq = latest + 1
+        # `if args.ttl` swallowed --ttl 0; an explicit 0 is explicit.
+        expires = now_ts + args.ttl if args.ttl is not None else None
         conn.execute(
             """
             INSERT INTO group_messages (message_id,group_id,seq,sender_agent,message_type,urgency,payload,attachments,expires_at,created_at)
@@ -1976,10 +2149,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             """,
             (args.group_id, args.from_agent, next_seq, now_ts, 0),
         )
-    except sqlite3.IntegrityError as exc:
-        conn.close()
-        raise SystemExit(f"error: insert failed: {exc}")
-    conn.commit()
+    audit_log("group_send", group_id=args.group_id, from_agent=args.from_agent, message_id=message_id, seq=next_seq)
     result = {"ok": True, "group_id": args.group_id, "message_id": message_id, "seq": next_seq, "latest_seq": next_seq}
     if soft_warning:
         result["warning"] = soft_warning
@@ -1989,7 +2159,13 @@ def cmd_group_send(args: argparse.Namespace) -> int:
 
 
 def cmd_group_status(args: argparse.Namespace) -> int:
+    validate_id("group_id", args.group_id)
     conn = connect()
+    # group status prints the member list and every member's cursors; it used
+    # to have no authorization at all. It is now member-only, like group
+    # messages.
+    require_auth(conn, args.agent_id)
+    _group_require_member(conn, args.group_id, args.agent_id)
     group = conn.execute("SELECT * FROM groups WHERE group_id=?", (args.group_id,)).fetchone()
     if group is None:
         conn.close()
@@ -2018,11 +2194,17 @@ def cmd_group_status(args: argparse.Namespace) -> int:
 
 
 def sweep_nudges(conn: sqlite3.Connection) -> tuple[int, int]:
-    """Return (nudges, stale) counts for overdue asks without a linked answer."""
+    """Return (nudges, stale) counts for overdue asks without a linked answer.
+
+    The whole read-then-insert runs in one transaction: every notifier used to
+    run this sweep on every poll tick in autocommit, so two notifiers could
+    both see nudge_count=0 and both insert a reminder. BEGIN IMMEDIATE makes
+    the second sweep see the first one's writes."""
     ts = now()
     nudges = 0
     stale = 0
-    asks = conn.execute(
+    with tx(conn):
+        asks = conn.execute(
         """
         SELECT * FROM messages
         WHERE message_type='ask' AND expects_response=1
@@ -2032,90 +2214,89 @@ def sweep_nudges(conn: sqlite3.Connection) -> tuple[int, int]:
           AND (expires_at IS NULL OR expires_at > ?)
         """,
         (ts, ts),
-    ).fetchall()
-    for ask in asks:
-        has_answer = conn.execute(
-            "SELECT 1 FROM messages WHERE answer_to_message_id=? LIMIT 1",
-            (ask["message_id"],),
-        ).fetchone() is not None
-        if has_answer:
-            conn.execute("UPDATE messages SET expects_response=0 WHERE message_id=?", (ask["message_id"],))
-            continue
-        ncount = int(ask["nudge_count"] or 0)
-        if ncount < 2:
-            deadline = ask["response_deadline"] if ask["response_deadline"] else ts
-            reminder_text = (
-                f"Reminder: unanswered ask {ask['message_id']} in thread {ask['thread_id']} "
-                f"is still pending. If handled elsewhere, send a pointer answer with "
-                f"bus answer --thread-id {ask['thread_id']} --from {ask['to_agent']} --text '...'. "
-                f"Otherwise reply now."
-            )
-            # system message to recipient
-            system_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
-                    payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,status,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    system_id,
-                    ask["thread_id"],
-                    None,
-                    "system",
-                    ask["to_agent"],
-                    "system",
-                    "normal",
-                    json_dumps({"text": reminder_text}),
-                    "[]",
-                    86400,
-                    ts + 86400,
-                    0,
-                    None,
-                    0,
-                    "queued",
-                    ts,
-                ),
-            )
-            await_nudge_backoff = NUDGE_STEP_SECONDS
-            conn.execute(
-                "UPDATE messages SET nudge_count=?, response_deadline=? WHERE message_id=?",
-                (ncount + 1, ts + await_nudge_backoff, ask["message_id"]),
-            )
-            nudges += 1
-        else:
-            notice_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
-                    payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,status,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    notice_id,
-                    ask["thread_id"],
-                    None,
-                    "system",
-                    ask["from_agent"],
-                    "system",
-                    "normal",
-                    json_dumps({"text": f"Ask {ask['message_id']} to {ask['to_agent']} is stale: no linked answer within nudge window."}),
-                    "[]",
-                    86400,
-                    ts + 86400,
-                    0,
-                    None,
-                    0,
-                    "queued",
-                    ts,
-                ),
-            )
-            conn.execute(
-                "UPDATE messages SET status='stale', expects_response=0, response_deadline=NULL, last_error=? WHERE message_id=?",
-                ("unanswered after nudges", ask["message_id"]),
-            )
+        ).fetchall()
+        for ask in asks:
+            has_answer = conn.execute(
+                "SELECT 1 FROM messages WHERE answer_to_message_id=? LIMIT 1",
+                (ask["message_id"],),
+            ).fetchone() is not None
+            if has_answer:
+                conn.execute("UPDATE messages SET expects_response=0 WHERE message_id=?", (ask["message_id"],))
+                continue
+            ncount = int(ask["nudge_count"] or 0)
+            if ncount < 2:
+                deadline = ask["response_deadline"] if ask["response_deadline"] else ts
+                reminder_text = (
+                    f"Reminder: unanswered ask {ask['message_id']} in thread {ask['thread_id']} "
+                    f"is still pending. If handled elsewhere, send a pointer answer with "
+                    f"bus answer --thread-id {ask['thread_id']} --from {ask['to_agent']} --text '...'. "
+                    f"Otherwise reply now."
+                )
+                # system message to recipient
+                system_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
+                        payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,status,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        system_id,
+                        ask["thread_id"],
+                        None,
+                        "system",
+                        ask["to_agent"],
+                        "system",
+                        "normal",
+                        json_dumps({"text": reminder_text}),
+                        "[]",
+                        86400,
+                        ts + 86400,
+                        0,
+                        None,
+                        0,
+                        "queued",
+                        ts,
+                    ),
+                )
+                await_nudge_backoff = NUDGE_STEP_SECONDS
+                conn.execute(
+                    "UPDATE messages SET nudge_count=?, response_deadline=? WHERE message_id=?",
+                    (ncount + 1, ts + await_nudge_backoff, ask["message_id"]),
+                )
+                nudges += 1
+            else:
+                notice_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,message_type,urgency,
+                        payload,attachments,ttl_seconds,expires_at,expects_response,response_deadline,nudge_count,status,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        notice_id,
+                        ask["thread_id"],
+                        None,
+                        "system",
+                        ask["from_agent"],
+                        "system",
+                        "normal",
+                        json_dumps({"text": f"Ask {ask['message_id']} to {ask['to_agent']} is stale: no linked answer within nudge window."}),
+                        "[]",
+                        86400,
+                        ts + 86400,
+                        0,
+                        None,
+                        0,
+                        "queued",
+                        ts,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE messages SET status='stale', expects_response=0, response_deadline=NULL, last_error=? WHERE message_id=?",
+                    ("unanswered after nudges", ask["message_id"]),
+                )
             stale += 1
-    conn.commit()
     return nudges, stale
 
 
@@ -2137,6 +2318,7 @@ def main() -> int:
     p.add_argument("--endpoint")
     p.add_argument("--machine-id")
     p.add_argument("--metadata")
+    p.add_argument("--rotate-token", action="store_true", help="intentionally replace an existing agent's token (requires the current token)")
     p.set_defaults(func=cmd_register)
 
     p = sub.add_parser("heartbeat", help="refresh agent liveness and session")
@@ -2224,14 +2406,17 @@ def main() -> int:
     p = sub.add_parser("peer", help="manage remote peers")
     peer_sub = p.add_subparsers(dest="peer_command", required=True)
     pa = peer_sub.add_parser("add", help="add or update peer")
+    pa.add_argument("--agent-id", help="operator identity (or set AGENT_BUS_AGENT)")
     pa.add_argument("--peer", required=True)
     pa.add_argument("--host")
     pa.add_argument("--base-url", required=True)
     pa.add_argument("--token", required=True)
     pa.set_defaults(func=cmd_peer_add)
     pl = peer_sub.add_parser("list", help="list peers")
+    pl.add_argument("--agent-id", help="operator identity (or set AGENT_BUS_AGENT)")
     pl.set_defaults(func=cmd_peer_list)
     pr = peer_sub.add_parser("remove", help="remove peer")
+    pr.add_argument("--agent-id", help="operator identity (or set AGENT_BUS_AGENT)")
     pr.add_argument("--peer", required=True)
     pr.set_defaults(func=cmd_peer_remove)
 
@@ -2287,8 +2472,9 @@ def main() -> int:
     gs.add_argument("--urgency", default="normal")
     gs.add_argument("--ttl", type=int)
     gs.set_defaults(func=cmd_group_send)
-    gst = g.add_parser("status", help="show group stats")
+    gst = g.add_parser("status", help="show group stats (authed members only)")
     gst.add_argument("--group-id", required=True)
+    gst.add_argument("--agent-id", required=True)
     gst.set_defaults(func=cmd_group_status)
 
     p = sub.add_parser("blob", help="content-addressed blob store (for long attachments)")
@@ -2310,9 +2496,11 @@ def main() -> int:
     p = sub.add_parser("outbox", help="cross-machine delivery queue")
     out_sub = p.add_subparsers(dest="outbox_command", required=True)
     ol = out_sub.add_parser("list", help="list outbox entries")
+    ol.add_argument("--agent-id", help="operator identity (or set AGENT_BUS_AGENT)")
     ol.add_argument("--limit", type=int, default=50)
     ol.set_defaults(func=cmd_outbox_list)
     of = out_sub.add_parser("flush", help="retry pending handoffs")
+    of.add_argument("--agent-id", help="operator identity (or set AGENT_BUS_AGENT)")
     of.add_argument("--timeout", type=int, default=10)
     of.set_defaults(func=cmd_outbox_flush)
 
@@ -2325,13 +2513,16 @@ def main() -> int:
     p = sub.add_parser("dlq", help="dead-letter queue controls")
     dlq_sub = p.add_subparsers(dest="dlq_command", required=True)
     lp = dlq_sub.add_parser("list", help="list dead/expired messages")
+    lp.add_argument("--agent-id", help="operator identity (or set AGENT_BUS_AGENT)")
     lp.add_argument("--status", choices=["dead", "expired"])
     lp.add_argument("--limit", type=int, default=50)
     lp.set_defaults(func=cmd_dlq_list)
     rp = dlq_sub.add_parser("retry", help="requeue dead/expired message")
+    rp.add_argument("--agent-id", help="operator identity (or set AGENT_BUS_AGENT)")
     rp.add_argument("--message-id", required=True)
     rp.set_defaults(func=cmd_dlq_retry)
     dp = dlq_sub.add_parser("discard", help="discard dead/expired message")
+    dp.add_argument("--agent-id", help="operator identity (or set AGENT_BUS_AGENT)")
     dp.add_argument("--message-id", required=True)
     dp.set_defaults(func=cmd_dlq_discard)
 
@@ -2340,13 +2531,9 @@ def main() -> int:
         os.environ["AGENT_BUS_DB"] = args.db
     if getattr(args, "from_agent", None) is None and args.command in {"send", "ask", "answer"}:
         raise SystemExit("error: --from/AGENT_BUS_AGENT is required")
-    # Auth checks need db
-    if args.command not in {"init"}:
-        # ensure init
-        try:
-            connect().close()
-        except Exception as exc:
-            raise SystemExit(f"error: database unavailable: {exc}")
+    # (Old code did a throwaway connect() here to "ensure init"; every command
+    # handler connects anyway, so this just ran the whole schema migration
+    # twice per invocation.)
     return args.func(args)
 
 

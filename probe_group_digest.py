@@ -18,6 +18,9 @@ DB = os.path.join(root, "world", "bus.db")
 TOK = os.path.join(root, "world", "tokens")
 os.environ["AGENT_BUS_DB"] = DB
 os.environ["AGENT_BUS_TOKEN_DIR"] = TOK
+# Without this the probe appends to the PRODUCTION bus_audit.log (the gates
+# probe sets it; the digest probe used to leak into the live audit trail).
+os.environ["AGENT_BUS_AUDIT_LOG"] = os.path.join(root, "world", "audit.log")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAIL = []
