@@ -18,7 +18,8 @@ transport remains available as a backup.
 - CLI entry point: `/Users/chen/Developer/agent-bus/bus.py` (thin
   compatibility shim)
 - Implementation: `/Users/chen/Developer/agent-bus/buslib/` (`config`, `db`,
-  `blobs`, `messaging`, `groups`, `remote`, `cli`)
+  `blobs`, `messaging`, `groups`, `remote`, `agents`, `maintenance`, `delivery`,
+  `adapters/`, `cli`)
 - Notifier: `/Users/chen/Developer/agent-bus/bus_agent.py`
 - Tokens (0600): `/Users/chen/Developer/agent-bus/tokens/<agent>.token`
 - Agent logs: `/Users/chen/Developer/agent-bus/bus_agent_<agent>.log`
@@ -82,7 +83,9 @@ Behavior changes over the v0 above; `probe_security.py` pins each one.
 ## Hardening pass 2 (review fixes)
 
 `probe_regressions.py` pins each of these; `.github/workflows/ci.yml` runs all
-four probes plus compile and shell-syntax checks.
+five probes plus compile, shell-syntax, and pyflakes checks. `probe_process.py`
+starts the real daemon and notifier and verifies handoff-injection, blob
+serving/range/auth/traversal, and background outbox flush end to end.
 
 - Daemon handoff applies the same id charset validation as the CLI to the
   claimed sender, `to_agent`, and `thread_id`; a remote peer can no longer

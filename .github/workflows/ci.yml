@@ -19,7 +19,7 @@ jobs:
       - name: Pyflakes
         run: |
           python3 -m pip install --quiet pyflakes
-          python3 -m pyflakes buslib/*.py bus_agent.py bus_daemon.py bus_ssh_gateway.py
+          python3 -m pyflakes buslib/*.py buslib/adapters/*.py bus_agent.py bus_daemon.py bus_ssh_gateway.py
       - name: Group gates probe
         run: python3 probe_group_gates.py
       - name: Group digest probe
@@ -28,3 +28,5 @@ jobs:
         run: python3 probe_security.py
       - name: Review regression probe
         run: python3 probe_regressions.py
+      - name: Process integration probe
+        run: python3 probe_process.py
