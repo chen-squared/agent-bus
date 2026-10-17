@@ -19,7 +19,7 @@ jobs:
       - name: Pyflakes
         run: |
           python3 -m pip install --quiet pyflakes
-          python3 -m pyflakes buslib/*.py buslib/adapters/*.py buslib/daemon/*.py bus_agent.py bus_daemon.py bus_ssh_gateway.py
+          python3 -m pyflakes buslib/*.py buslib/adapters/*.py buslib/daemon/*.py bus_agent.py bus_daemon.py bus_ssh_gateway.py probe_*.py
       - name: Package install smoke
         run: |
           python3 -m pip install --quiet --no-deps .
