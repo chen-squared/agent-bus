@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .agents import cmd_register
+from .agents import cmd_register, resolve_opencode_cli
 from .config import BUS_HOME, ensure_home, home_info, json_dumps, log_dir, run_dir
 from .db import connect
 from .notifier import main as notifier_main
@@ -155,11 +155,17 @@ def _find_process(primary: Path, legacy: Path, predicate) -> dict[str, Any] | No
 
 
 def _find_notifier(agent_id: str) -> dict[str, Any] | None:
-    return _find_process(
+    info = _find_process(
         _notifier_pid_path(agent_id),
         _legacy_notifier_pid_path(agent_id),
         lambda command: _looks_like_notifier(command, agent_id),
     )
+    if info is not None:
+        if info.get("legacy"):
+            info.setdefault("log", str(BUS_HOME / f"bus_agent_{agent_id}.log"))
+        else:
+            info.setdefault("log", str(log_dir() / f"notifier-{agent_id}.log"))
+    return info
 
 
 def _find_daemon(port: int) -> dict[str, Any] | None:
@@ -384,6 +390,66 @@ def _infer_agent_type(adapter: str) -> str:
     return {"opencode": "opencode", "tmux": "tmux", "command": "command"}.get(adapter, adapter)
 
 
+def _probe_opencode_session(args: argparse.Namespace) -> dict[str, Any]:
+    """Best-effort opencode session probe.
+
+    `up` used to trust any session id and report the notifier active even when
+    the underlying model turn had failed. That is a false liveness signal. The
+    probe is adapter-specific (opencode semantics), so callers can make it
+    strict with --verify-session or just consume the warning.
+    """
+    cli = args.cli or resolve_opencode_cli()
+    try:
+        result = subprocess.run(
+            [cli, "api", "session.get", "--param", f"sessionID={args.session_id}"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "cli": cli, "probe_error": f"{type(exc).__name__}: {exc}"}
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "cli": cli,
+            "probe_error": (result.stderr or result.stdout or "session.get failed").strip()[:500],
+        }
+    try:
+        data = json.loads(result.stdout).get("data") or {}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return {"ok": False, "cli": cli, "probe_error": "session.get returned non-JSON"}
+    model = data.get("model")
+    if isinstance(model, dict):
+        model = model.get("id")
+    return {
+        "ok": True,
+        "cli": cli,
+        "model": model,
+        "outcome": data.get("outcome"),
+        "session_id": args.session_id,
+    }
+
+
+def _session_probe_failed(probe: dict[str, Any]) -> bool:
+    return not probe.get("ok") or probe.get("outcome") == "failed"
+
+
+def _up_payload(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
+    if not getattr(args, "quiet", False):
+        return payload
+    # Agents often stop after a large tool response. Keep the machine-readable
+    # contract but drop the redundant home/command dump in --quiet mode.
+    return {
+        "ok": payload.get("ok", True),
+        "already_running": payload.get("already_running", False),
+        "agent_id": payload.get("agent_id") or args.agent_id,
+        "session_probe": payload.get("session_probe"),
+        "notifier": {
+            k: (payload.get("notifier") or {}).get(k)
+            for k in ("pid", "pid_file", "log")
+        },
+        "daemon": payload.get("daemon"),
+    }
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     if not args.agent_id:
         raise SystemExit("error: --agent-id or AGENT_BUS_AGENT is required")
@@ -424,6 +490,30 @@ def cmd_up(args: argparse.Namespace) -> int:
             )
     if adapter == "tmux" and not args.tmux_target:
         raise SystemExit("error: --tmux-target is required for the tmux adapter")
+    if args.verify_session and adapter != "opencode":
+        raise SystemExit("error: --verify-session is only supported for the opencode adapter")
+
+    session_probe: dict[str, Any] | None = None
+    if adapter == "opencode":
+        session_probe = _probe_opencode_session(args)
+        if args.verify_session:
+            if not session_probe.get("ok"):
+                raise SystemExit(
+                    f"error: opencode session verification failed: {session_probe.get('probe_error')}"
+                )
+            if session_probe.get("outcome") == "failed":
+                raise SystemExit(
+                    f"error: opencode session {args.session_id} reports outcome=failed "
+                    f"(model={session_probe.get('model')}); use --force or a working session, "
+                    "or omit --verify-session to start anyway"
+                )
+        elif _session_probe_failed(session_probe):
+            detail = session_probe.get("probe_error") or f"outcome={session_probe.get('outcome')}"
+            print(
+                f"warning: opencode session probe for {args.session_id} is unhealthy: {detail} "
+                "(use --verify-session to make this fatal)",
+                file=sys.stderr,
+            )
 
     env = _child_env(args.agent_id)
     env["AGENT_BUS_CWD"] = args.cwd
@@ -431,15 +521,16 @@ def cmd_up(args: argparse.Namespace) -> int:
     if existing is not None and not args.force:
         daemon = _start_daemon(args, args.cwd, env) if args.daemon else None
         info = home_info()
-        print(json_dumps({
+        print(json_dumps(_up_payload(args, {
             "ok": True,
             "already_running": True,
             "agent_id": args.agent_id,
             **info,
             "notifier": existing,
             "daemon": daemon,
+            "session_probe": session_probe,
             "hint": "use `agent-bus up ... --force` to replace it",
-        }))
+        })))
         return 0
     # Authenticate/register before stopping a working notifier. A bad token or
     # missing session should fail without creating an offline window.
@@ -491,14 +582,16 @@ def cmd_up(args: argparse.Namespace) -> int:
     if args.daemon:
         daemon = _start_daemon(args, args.cwd, env)
 
-    print(json_dumps({
+    print(json_dumps(_up_payload(args, {
         "ok": True,
         "already_running": False,
+        "agent_id": args.agent_id,
         "agent": registration,
         **home_info(),
         "notifier": notifier,
         "daemon": daemon,
-    }))
+        "session_probe": session_probe,
+    })))
     return 0
 
 
@@ -564,6 +657,7 @@ Database: {info['db']}
 
 One-command start (registers the agent and starts a detached notifier):
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...>
+  agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> --verify-session
   agent-bus up --agent-id <id> --agent-type command --notify-cmd '<your hook>'
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> --daemon
 
@@ -585,12 +679,17 @@ Groups:
   agent-bus group send --from <id> --group-id <group> --text "hello"
   agent-bus group messages --group-id <group> --agent-id <id>
   agent-bus group read --group-id <group> --agent-id <id> --seq <n>
+  agent-bus group catch-up --group-id <group> --agent-id <id>
 
 Stop:
   agent-bus down --agent-id <id> [--daemon]
 
 The notifier log is under {info['logs']}; the pid file is under {info['run']}.
-Set AGENT_BUS_HOME to use a different bus world before starting.""")
+Set AGENT_BUS_HOME to use a different bus world before starting.
+
+Restart note: `agent-bus up --force` replaces the running notifier. If an
+agent runs that from inside its own bus turn, it also kills the notifier that
+may be delivering that turn; prefer restarting from an external shell.""")
     return 0
 
 

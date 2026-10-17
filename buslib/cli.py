@@ -15,9 +15,9 @@ from .blobs import cmd_blob_gc, cmd_blob_get, cmd_blob_list, cmd_blob_put
 from .bootstrap import cmd_down, cmd_guide, cmd_home, cmd_up
 from .db import cmd_init
 from .groups import (
-    cmd_group_close, cmd_group_create, cmd_group_join, cmd_group_leave,
-    cmd_group_list, cmd_group_messages, cmd_group_read, cmd_group_send,
-    cmd_group_status,
+    cmd_group_catch_up, cmd_group_close, cmd_group_create, cmd_group_join,
+    cmd_group_leave, cmd_group_list, cmd_group_messages, cmd_group_read,
+    cmd_group_send, cmd_group_status,
 )
 from .maintenance import (
     cmd_dlq_discard, cmd_dlq_list, cmd_dlq_retry, cmd_prune, cmd_sweep,
@@ -77,7 +77,9 @@ def main() -> int:
     p.add_argument("--daemon-port", type=int, default=int(os.environ.get("AGENT_BUS_DAEMON_PORT", "8780")))
     p.add_argument("--bind", default=os.environ.get("AGENT_BUS_DAEMON_BIND", "127.0.0.1"))
     p.add_argument("--foreground", action="store_true", help="run the notifier in this process")
-    p.add_argument("--force", action="store_true", help="replace an already running notifier")
+    p.add_argument("--force", action="store_true", help="replace an already running notifier; when an agent runs this from inside its own bus turn it also kills the notifier delivering that turn, so prefer an external shell")
+    p.add_argument("--verify-session", action="store_true", help="fail before starting if the opencode session probe fails or reports outcome=failed")
+    p.add_argument("--quiet", action="store_true", help="print only the short agent-facing JSON summary")
     p.set_defaults(func=cmd_up)
 
     p = sub.add_parser("down", help="stop an agent's notifier (and optionally its daemon)")
@@ -259,6 +261,11 @@ def main() -> int:
     gr.add_argument("--seq", type=nonneg_int, help="default latest; clamped to last_served_seq unless --allow-gap")
     gr.add_argument("--allow-gap", action="store_true", help="ack seqs that were never returned by group messages")
     gr.set_defaults(func=cmd_group_read)
+    gcu = g.add_parser("catch-up", help="page all unread group messages and ack exactly what was served")
+    gcu.add_argument("--group-id", required=True)
+    gcu.add_argument("--agent-id", required=True)
+    gcu.add_argument("--limit", type=nonneg_int, default=200, help="page size; must be > 0")
+    gcu.set_defaults(func=cmd_group_catch_up)
     gs = g.add_parser("send", help="send a group message")
     gs.add_argument("--from", dest="from_agent", required=True)
     gs.add_argument("--group-id", required=True)

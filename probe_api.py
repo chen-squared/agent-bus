@@ -58,7 +58,16 @@ def main() -> int:
         check("alice is active", statuses.get("alice") == "active", str(statuses))
         check("bob is active", statuses.get("bob") == "active", str(statuses))
 
-        print("C stop")
+        print("C groups through the API")
+        check("group creates", alice.group_create("api-group", rate_seconds=0).get("ok") is True)
+        check("bob joins", bob.group_join("api-group").get("ok") is True)
+        for i in range(3):
+            check(f"alice group send {i}", alice.group_send("api-group", f"g{i}").get("ok") is True)
+        caught = bob.group_catch_up("api-group")
+        check("catch-up drains the group", caught.get("messages_read") == 3 and caught.get("last_read_seq") == 3, str(caught))
+        check("bob sends after catch-up", bob.group_send("api-group", "caught up").get("ok") is True)
+
+        print("D stop")
         check("alice stops", alice.stop().get("ok") is True)
         check("bob stops", bob.stop().get("ok") is True)
         print(f"\nRESULT: {'ALL PASS' if not FAIL else str(len(FAIL)) + ' FAILED'}")

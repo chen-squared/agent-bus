@@ -14,12 +14,21 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e /path/to/agent-bus      # or: pip install agent-bus
 agent-bus guide
-agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...>
+agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> --verify-session --quiet
 ```
 
 `agent-bus up` registers the agent, starts a detached notifier, records a
 pid/log pair, and prints JSON. `--daemon` also starts the localhost HTTP
-handoff daemon. `agent-bus down --agent-id <id>` stops the notifier.
+handoff daemon. For opencode, `--verify-session` fails before starting when
+the session probe fails or reports `outcome=failed`; without it the probe is
+best-effort and is included in the output/warning. `--quiet` keeps only the
+short agent-facing summary.
+
+`up --force` kills the notifier process it replaces. If an agent runs it from
+inside its own bus turn, that is also the process delivering the turn; prefer
+an external shell for restarts. The notifier itself is a separate process from
+the opencode session, but the timing can still interrupt an in-flight turn or
+ack. `agent-bus down --agent-id <id>` stops the notifier.
 `agent-bus home` reports the resolved state directory.
 
 Python embedding uses the same commands:
@@ -118,12 +127,14 @@ Behavior changes over the v0 above; `probe_security.py` pins each one.
 ## Hardening pass 2 (review fixes)
 
 `probe_regressions.py` pins each of these; `.github/workflows/ci.yml` runs all
-seven probes plus compile, shell-syntax, and pyflakes checks. `probe_process.py`
+nine probes plus compile, shell-syntax, and pyflakes checks. `probe_process.py`
 starts the real daemon and notifier and verifies handoff-injection, blob
 serving/range/auth/traversal, and background outbox flush end to end.
 `probe_up.py` verifies the packaged bootstrap: init, detached `up`, idempotent
 `up`, delivery through the command adapter, and `down`. `probe_api.py` does the
-same lifecycle through `from buslib import Bus`.
+same lifecycle through `from buslib import Bus`. `probe_session_verify.py`
+covers strict and warning-only opencode session probes. `probe_group_catch_up.py`
+covers multi-page catch-up and the read gate.
 
 - Daemon handoff applies the same id charset validation as the CLI to the
   claimed sender, `to_agent`, and `thread_id`; a remote peer can no longer
@@ -377,7 +388,9 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
 - Monotonic per-group seq with sender-side acknowledge gate.
 - Throttling layers: per-sender rate, per-group ceiling, backpressure.
 - Sender-side acknowledge gate keys on `group_read_state.last_read_seq`, which the
-  notifier digest never advances; recovery is `group read --seq <latest_seq>`.
+  notifier digest never advances; recovery is
+  `group catch-up --group-id <g> --agent-id <me>` (or manual
+  `group messages` + `group read --seq <latest_seq>`).
 - Three cursors, never writing each other: `last_read_seq` (self-reported, gates
   sends), `last_digest_seq` (notifier render watermark), `last_served_seq` (highest
   seq `group messages` actually returned). `group messages` pages oldest-first under
@@ -389,7 +402,7 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
   `must confirm latest message first`, `rate limited`, `group ceiling reached`,
   `group backpressure: too many unread participants`.
 - Notifier digest: one digest per unseen watermark.
-- CLI: `group create/join/leave/close/list/messages/read/send/status`.
+- CLI: `group create/join/leave/close/list/messages/read/catch-up/send/status`.
 - Liveness: `bus liveness --agent-id <id>` separates "notifier process alive" from
   "model answered". `model_liveness` comes from opencode's `session.get` outcome for
   `agent_type=opencode` only; every other adapter returns `unknown` with

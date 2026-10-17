@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import json
 import sqlite3
 import sys
 import uuid
@@ -257,7 +260,7 @@ def cmd_group_messages(args: argparse.Namespace) -> int:
             (args.group_id, args.agent_id, served_through, now()),
         )
     truncated = unread_total > len(rows)
-    if truncated:
+    if truncated and not getattr(args, "quiet", False):
         span = f"seq {rows[0]['seq']}-{served_through}" if rows else "no rows at all"
         print(
             f"warning: returned {len(rows)} of {unread_total} unread ({span}); "
@@ -488,6 +491,83 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     return 0
 
 
+def _captured_json(func, args: argparse.Namespace) -> dict:
+    """Run an existing CLI handler and parse what it printed to stdout."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        func(args)
+    try:
+        return json.loads(buf.getvalue())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"error: group catch-up could not parse {func.__name__} output: {exc}") from exc
+
+
+def cmd_group_catch_up(args: argparse.Namespace) -> int:
+    """Drain unread group pages and ack what was actually served.
+
+    The notifier digest deliberately advances only `last_digest_seq`. An agent
+    that has digested everything still trips the read gate until it manually
+    pages `group messages` and calls `group read`. This command is the safe
+    shorthand: it uses the same clamps and auth as the two lower-level calls,
+    so it cannot ack a gap it never saw.
+    """
+    validate_id("group_id", args.group_id)
+    validate_id("agent_id", args.agent_id)
+    limit = 200 if args.limit is None else args.limit
+    if limit <= 0:
+        raise SystemExit("error: group catch-up --limit must be > 0")
+    pages = 0
+    messages_read = 0
+    latest = 0
+    last_read = 0
+    while True:
+        page = _captured_json(
+            cmd_group_messages,
+            argparse.Namespace(
+                group_id=args.group_id, agent_id=args.agent_id,
+                limit=limit, quiet=True,
+            ),
+        )
+        pages += 1
+        latest = int(page.get("latest_seq") or 0)
+        messages_read += int(page.get("count") or 0)
+        served = int(page.get("served_through_seq") or 0)
+        if page.get("count"):
+            read = _captured_json(
+                cmd_group_read,
+                argparse.Namespace(
+                    group_id=args.group_id, agent_id=args.agent_id,
+                    seq=served, allow_gap=False,
+                ),
+            )
+            last_read = int(read.get("last_read_seq") or 0)
+        if not page.get("truncated"):
+            break
+        if pages >= 10000:
+            raise SystemExit("error: group catch-up exceeded 10000 pages; refusing to loop")
+    # The final read covers the "nothing live remains" case where group
+    # messages reports served_through=latest but returned no rows.
+    read = _captured_json(
+        cmd_group_read,
+        argparse.Namespace(
+            group_id=args.group_id, agent_id=args.agent_id,
+            seq=latest, allow_gap=False,
+        ),
+    )
+    last_read = int(read.get("last_read_seq") or last_read)
+    print(json_dumps({
+        "ok": True,
+        "group_id": args.group_id,
+        "agent_id": args.agent_id,
+        "pages": pages,
+        "messages_read": messages_read,
+        "latest_seq": latest,
+        "last_read_seq": last_read,
+        "read_through": last_read,
+    }))
+    return 0
+
+
 def cmd_group_status(args: argparse.Namespace) -> int:
     validate_id("group_id", args.group_id)
     conn = connect()
@@ -524,6 +604,7 @@ def cmd_group_status(args: argparse.Namespace) -> int:
 
 
 __all__ = [
+    "cmd_group_catch_up",
     "cmd_group_close",
     "cmd_group_create",
     "cmd_group_join",

@@ -119,6 +119,8 @@ class Bus:
         model_tier: str | None = None,
         capabilities: str | None = None,
         force: bool = False,
+        verify_session: bool = False,
+        quiet: bool = False,
     ) -> dict[str, Any]:
         agent = self._require_agent()
         if adapter is None:
@@ -147,6 +149,10 @@ class Bus:
             argv += ["--daemon"]
         if force:
             argv += ["--force"]
+        if verify_session:
+            argv += ["--verify-session"]
+        if quiet:
+            argv += ["--quiet"]
         return self._call(*argv, timeout=30.0)
 
     def stop(self, *, daemon: bool = False, daemon_port: int = 8780) -> dict[str, Any]:
@@ -297,6 +303,10 @@ class Bus:
         if allow_gap:
             argv += ["--allow-gap"]
         return self._call(*argv)
+
+    def group_catch_up(self, group_id: str, *, limit: int = 200) -> dict[str, Any]:
+        agent = self._require_agent()
+        return self._call("group", "catch-up", "--group-id", group_id, "--agent-id", agent, "--limit", limit)
 
 
 __all__ = ["Bus", "BusError"]

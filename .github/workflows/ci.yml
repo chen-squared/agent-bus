@@ -40,3 +40,7 @@ jobs:
         run: python3 probe_up.py
       - name: Python API probe
         run: python3 probe_api.py
+      - name: Session verification probe
+        run: python3 probe_session_verify.py
+      - name: Group catch-up probe
+        run: python3 probe_group_catch_up.py

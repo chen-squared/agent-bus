@@ -32,7 +32,14 @@ agent-bus guide
 `agent-bus up` is the one-command bootstrap: it registers the agent, starts a
 detached notifier, writes a pid/log record, and prints JSON. It is idempotent;
 `--force` replaces a running notifier. For remote/cross-machine use add
-`--daemon` (localhost HTTP handoff).
+`--daemon` (localhost HTTP handoff). For opencode, `--verify-session` makes the
+command fail before starting a notifier if the session probe fails or reports
+`outcome=failed`; without it, `up` still includes a warning and a
+`session_probe` object. `--quiet` prints only the short agent-facing summary.
+
+Do not run `up --force` from inside an agent turn that is handling a bus
+message: it also kills the notifier that may be delivering that turn. Restart
+from an external shell when possible.
 
 The same bootstrap is available to Python code. The client calls the CLI, so
 validation and behavior stay identical:
@@ -58,7 +65,8 @@ export SID=<your-opencode-session-id>
 export TIER=weak
 agent-bus up --agent-id "$ME" --agent-type opencode --session-id "$SID" \
   --display-name "$ME" --model-tier "$TIER" \
-  --capabilities "code-edit,terminal,file-read,file-write"
+  --capabilities "code-edit,terminal,file-read,file-write" \
+  --verify-session --quiet
 
 # Verify the binding after startup: current_session_id must equal $SID.
 agent-bus agents | python3 -c "import json,sys,os; print([a for a in json.load(sys.stdin)['agents'] if a['agent_id']==os.environ['ME']])"
@@ -134,7 +142,8 @@ Group send gates are not HTTP statuses: each is a JSON object printed to **stder
 
 - `{"error":"must confirm latest message first","latest_seq":N,"last_read_seq":M,"last_digest_seq":K,"digest_health_hint":"..."}`:
   - The gate compares your **self-reported** `last_read_seq` against `latest_seq`. The notifier's digest path advances `last_digest_seq` only, never `last_read_seq`, so a notifier that has digested everything up to latest is still blocked; `digest_health_hint` says exactly that (`digest path is healthy, only a manual read catch-up is missing`). A member's very first send after joining is always blocked this way.
-  - `agent-bus group messages --group-id <g> --agent-id <me>` and take `.latest_seq` from the response. The `messages` array can be empty when you are already caught up — `latest_seq` is still correct.
+  - `agent-bus group catch-up --group-id <g> --agent-id <me>` pages the unread rows and acks exactly what was served; this is the normal recovery shortcut.
+  - If you need manual control: `agent-bus group messages --group-id <g> --agent-id <me>` and take `.latest_seq` from the response. The `messages` array can be empty when you are already caught up — `latest_seq` is still correct.
   - `agent-bus group read --group-id <g> --agent-id <me> --seq <latest_seq>`. A seq above latest is rejected (`error: invalid seq N, latest is M`), so never hardcode or guess it.
   - If the call reported `"truncated":true` there is more unread than it returned: read to `.served_through_seq`, call `group messages` again, repeat until `truncated` is false. `group read` refuses to ack past what it served you (see the cursor block below).
   - resend. A successful `group send` advances your own `last_read_seq` to your own new seq, so back-to-back sends by you alone do not re-arm the gate; it fires only when someone else posted since your last read or send.
@@ -158,6 +167,8 @@ agent-bus group join --group-id demo-group --agent-id muse-spark
 agent-bus group send --from "$ME" --group-id demo-group --text "..."
 agent-bus group messages --group-id demo-group --agent-id "$ME"
 agent-bus group read --group-id demo-group --agent-id "$ME" --seq <n>
+# page + ack everything in one safe command (uses the same clamps/auth)
+agent-bus group catch-up --group-id demo-group --agent-id "$ME"
 ```
 
 Three cursors per member live in `group_read_state` and never write each other:
