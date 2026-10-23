@@ -30,6 +30,7 @@ from .remote import (
     cmd_outbox_flush, cmd_outbox_list, cmd_peer_add, cmd_peer_list,
     cmd_peer_remove, cmd_status,
 )
+from .skill import cmd_skill_install, cmd_skill_path, cmd_skill_show
 from .validation import nonneg_float, nonneg_int, validate_id
 
 
@@ -97,6 +98,19 @@ def main() -> int:
 
     p = sub.add_parser("quickstart", help="alias for guide")
     p.set_defaults(func=cmd_guide)
+
+    p = sub.add_parser("skill", help="show or install the bundled agent skill")
+    skill_sub = p.add_subparsers(dest="skill_command", required=True, parser_class=BusArgumentParser)
+    ss = skill_sub.add_parser("show", help="print the bundled SKILL.md")
+    ss.set_defaults(func=cmd_skill_show)
+    sp = skill_sub.add_parser("path", help="show where the skill is bundled and installed")
+    sp.add_argument("--dir", help="skills root (default: ~/.claude/skills or AGENT_BUS_SKILL_DIR)")
+    sp.set_defaults(func=cmd_skill_path)
+    si = skill_sub.add_parser("install", help="install the skill and its launcher into a harness")
+    si.add_argument("--dir", help="skills root (default: ~/.claude/skills or AGENT_BUS_SKILL_DIR)")
+    si.add_argument("--force", action="store_true", help="replace an existing different skill or launcher")
+    si.add_argument("--dry-run", action="store_true", help="report what would change without writing")
+    si.set_defaults(func=cmd_skill_install)
 
     p = sub.add_parser("register", help="register or update agent")
     p.add_argument("--agent-id", required=True)

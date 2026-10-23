@@ -17,3 +17,6 @@ agent-bus-notifier = "buslib.notifier:main"
 
 [tool.setuptools.packages.find]
 include = ["buslib*"]
+
+[tool.setuptools.package-data]
+"buslib.skills" = ["agent-bus/SKILL.md"]

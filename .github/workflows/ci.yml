@@ -19,13 +19,19 @@ jobs:
       - name: Pyflakes
         run: |
           python3 -m pip install --quiet pyflakes
-          python3 -m pyflakes buslib/*.py buslib/adapters/*.py buslib/daemon/*.py bus_agent.py bus_daemon.py bus_ssh_gateway.py probe_*.py
+          python3 -m pyflakes buslib/*.py buslib/adapters/*.py buslib/daemon/*.py buslib/skills/*.py bus_agent.py bus_daemon.py bus_ssh_gateway.py probe_*.py
       - name: Package install smoke
         run: |
           python3 -m pip install --quiet --no-deps .
           agent-bus --help >/dev/null
           agent-bus-daemon --help >/dev/null
           agent-bus-notifier --help >/dev/null
+          agent-bus skill path >/dev/null
+          agent-bus skill install --dir "$RUNNER_TEMP/agent-skills"
+          test -f "$RUNNER_TEMP/agent-skills/agent-bus/SKILL.md"
+          "$RUNNER_TEMP/agent-skills/agent-bus/run" --version >/dev/null
+      - name: Skill install probe
+        run: python3 probe_skill.py
       - name: Group gates probe
         run: python3 probe_group_gates.py
       - name: Group digest probe

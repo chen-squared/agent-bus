@@ -54,10 +54,15 @@ State resolution:
 
 - Implementation: `buslib/` (`config`, `db`, `blobs`, `messaging`, `groups`,
   `remote`, `agents`, `maintenance`, `delivery`, `notifier`, `bootstrap`,
-  `adapters/`, `daemon/`, `cli`)
+  `skill`, `adapters/`, `daemon/`, `cli`)
 - Packaging: `pyproject.toml` exposes `agent-bus`, `agent-bus-daemon`, and
   `agent-bus-notifier` console scripts; `bus.py`/`bus_agent.py`/`bus_daemon.py`
   remain thin compatibility shims.
+- Agent skill: `buslib/skills/agent-bus/SKILL.md`, included as package data.
+  `agent-bus skill install` copies it to `~/.claude/skills/agent-bus` (or
+  `--dir`/`AGENT_BUS_SKILL_DIR`) and writes a `run` launcher pinned to the
+  installing Python. The skill replaces byobu-communicate/byobu-send and
+  explicitly forbids tmux `send-keys` message injection.
 - State: `AGENT_BUS_HOME` (or the source checkout / platform data dir above).
   It contains `bus.db`, `tokens/<agent>.token` (0600), `blobs/`, `run/`, and
   `logs/`.
@@ -127,7 +132,7 @@ Behavior changes over the v0 above; `probe_security.py` pins each one.
 ## Hardening pass 2 (review fixes)
 
 `probe_regressions.py` pins each of these; `.github/workflows/ci.yml` runs all
-nine probes plus compile, shell-syntax, and pyflakes checks. `probe_process.py`
+ten probes plus compile, shell-syntax, and pyflakes checks. `probe_process.py`
 starts the real daemon and notifier and verifies handoff-injection, blob
 serving/range/auth/traversal, and background outbox flush end to end.
 `probe_up.py` verifies the packaged bootstrap: init, detached `up`, idempotent
@@ -135,6 +140,8 @@ serving/range/auth/traversal, and background outbox flush end to end.
 same lifecycle through `from buslib import Bus`. `probe_session_verify.py`
 covers strict and warning-only opencode session probes. `probe_group_catch_up.py`
 covers multi-page catch-up, stored history, and the read gate.
+`probe_skill.py` verifies the packaged skill, idempotent install, launcher,
+custom roots, and refusal to clobber a locally edited skill.
 
 - Daemon handoff applies the same id charset validation as the CLI to the
   claimed sender, `to_agent`, and `thread_id`; a remote peer can no longer
@@ -180,6 +187,11 @@ covers multi-page catch-up, stored history, and the read gate.
 
 ```sh
 cd /Users/chen/Developer/agent-bus
+
+# Install the agent-facing skill (replaces byobu-communicate/byobu-send)
+agent-bus skill install
+agent-bus skill path
+agent-bus skill show
 
 # Register or update an agent
 agent-bus register --agent-id <id> --agent-type <opencode|claude-code|cursor|...> \

@@ -41,6 +41,27 @@ Do not run `up --force` from inside an agent turn that is handling a bus
 message: it also kills the notifier that may be delivering that turn. Restart
 from an external shell when possible.
 
+### Agent skill
+
+The package ships an agent-facing skill. Install it once per harness:
+
+```bash
+agent-bus skill install          # ~/.claude/skills/agent-bus
+agent-bus skill path             # source and install paths
+agent-bus skill show             # print the bundled SKILL.md
+```
+
+The installer copies `SKILL.md` and writes a `run` launcher pinned to the
+Python interpreter that owns `buslib`, so an agent session can use the skill
+even when the venv is not on PATH. It refuses to overwrite a different file
+unless you pass `--force`. Use `--dir <skills-root>` or
+`AGENT_BUS_SKILL_DIR` for another harness.
+
+This skill replaces the `byobu-send` and `byobu-communicate` skills. Remove any
+previously installed copies (and the `cc-switch`/dotfile targets behind their
+symlinks) before installing it. agent-bus never injects keystrokes into a
+tmux/byobu pane; a message is stored until the recipient's notifier delivers it.
+
 The same bootstrap is available to Python code. The client calls the CLI, so
 validation and behavior stay identical:
 
@@ -266,6 +287,10 @@ The same `pyproject.toml` exposes lower-level entry points:
 agent-bus-daemon --help
 agent-bus-notifier --help
 ```
+
+The agent skill is packaged at `buslib/skills/agent-bus/SKILL.md` (included in
+the wheel by `package-data`). `agent-bus skill install` copies it into a
+harness skills directory and writes a launcher pinned to the installing Python.
 
 State resolution:
 

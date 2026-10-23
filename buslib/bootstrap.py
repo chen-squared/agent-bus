@@ -667,6 +667,11 @@ Check:
   agent-bus status
   agent-bus liveness --agent-id <id>
 
+Agent skill:
+  agent-bus skill install          # ~/.claude/skills/agent-bus (copy + launcher)
+  agent-bus skill show             # print the bundled SKILL.md
+  agent-bus skill path             # show source and install paths
+
 Talk:
   agent-bus send --from <id> --to <peer> --text "hello"
   agent-bus ask  --from <id> --to <peer> --text "question" --wait
