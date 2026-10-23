@@ -77,7 +77,7 @@ State resolution:
 
 - Bind all HTTP transports to `127.0.0.1` (fixed from old 0.0.0.0).
 - Each agent has a bearer-style token file mode 0600.
-- `bus send/ask/answer/inbox/ack/heartbeat` verifies that the token owner
+- `agent-bus send/ask/answer/inbox/ack/heartbeat` verifies that the token owner
   matches the `--from/--agent-id` identity.
 - Future v1: Unix socket + peer credentials.
 
@@ -174,7 +174,7 @@ custom roots, and refusal to clobber a locally edited skill.
 - Sweeps are throttled (`AGENT_BUS_SWEEP_INTERVAL`, default 10s) and
   `fetch_inbox` no longer writes; `sweep_nudges` does a read-only precheck
   before taking the write lock. This cuts idle notifier write churn.
-- `bus prune --days N` provides retention for terminal messages, outbox
+- `agent-bus prune --days N` provides retention for terminal messages, outbox
   history, and orphan deliveries. DB/WAL/token/blob/audit files are created
   private (0600/0700) and tightened on connect.
 - `group create --ceiling-per-minute 0` is rejected: the gate is
@@ -238,7 +238,7 @@ agent-bus dlq discard --message-id <id>
 - `answer` is distinct from `ack`: ack means the adapter accepted delivery;
   answer means the collaborator completed the request.
 - TTL expiry and DLQ (dead status after bounded retries) are swept by pollers
-  and `bus sweep`.
+  and `agent-bus sweep`.
 - Heartbeat expiry marks agents stale; messages remain queued for offline
   agents.
 
@@ -295,7 +295,7 @@ Other code agents (Claude Code, Cursor, etc.) can participate by:
 1. Running any shell command.
 2. Registering an agent id.
 3. Running a notifier with adapter `command` or tmux.
-4. Using `bus send/ask/answer/find` from the terminal.
+4. Using `agent-bus send/ask/answer/find` from the terminal.
 
 ## Attachment rules
 
@@ -326,10 +326,10 @@ end-to-end TTL, local DLQ, and SSH as the auth boundary rather than custom crypt
 ### New pieces
 
 - `bus_daemon.py`: per-machine localhost HTTP daemon (`/health`, `/bus/handoff`).
-- `peers`: static peer config (`bus peer add/list/remove`).
-- `outbox`: pending/retrying cross-machine deliveries (`bus outbox list/flush`).
+- `peers`: static peer config (`agent-bus peer add/list/remove`).
+- `outbox`: pending/retrying cross-machine deliveries (`agent-bus outbox list/flush`).
 - `machine_id`: registry and handoff metadata; heartbeats track machine.
-- `bus status`: aggregate agents, peers, outbox depth, DLQ depth.
+- `agent-bus status`: aggregate agents, peers, outbox depth, DLQ depth.
 - Address syntax: `agent@peer`, e.g. `muse-spark@machine-b`.
 
 ### Typical two-machine setup
@@ -382,14 +382,14 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
 - Recipient notifier materializes blobs into cache and injects paths into the
   native agent; partial failure retries through the message retry counter and
   lands in the DLQ with `last_error` after the retry budget.
-- Blob CLI: `bus blob put/get/list/gc`.
+- Blob CLI: `agent-bus blob put/get/list/gc`.
 - GC removes unreferenced blobs older than grace, or all with `--force`.
 - Max blob size defaults to 10 MB via `AGENT_BUS_BLOB_MAX_BYTES`.
 
 ### Still deferred
 
 - SQLCipher at rest.
-- Pairing codes (SSH authorized keys + `bus peer add` remains sufficient).
+- Pairing codes (SSH authorized keys + `agent-bus peer add` remains sufficient).
 - SSE/full push.
 - gRPC.
 - Complete peer add over SSH automation (manual SSH tunnel documented).
@@ -419,7 +419,7 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
   `send` reports `target_stale=true` for a recipient without a recent
   heartbeat/notifier; the message is still queued. Audit event JSON is emitted
   on stderr, while stdout is the command result.
-- Liveness: `bus liveness --agent-id <id>` separates "notifier process alive" from
+- Liveness: `agent-bus liveness --agent-id <id>` separates "notifier process alive" from
   "model answered". `model_liveness` comes from opencode's `session.get` outcome for
   `agent_type=opencode` only; every other adapter returns `unknown` with
   `liveness_source:"none"`, because the bus sees only the adapter's exit code. The

@@ -203,7 +203,7 @@ def sweep_nudges(conn: sqlite3.Connection) -> tuple[int, int]:
                 reminder_text = (
                     f"Reminder: unanswered ask {ask['message_id']} in thread {ask['thread_id']} "
                     f"is still pending. If handled elsewhere, send a pointer answer with "
-                    f"bus answer --thread-id {ask['thread_id']} --from {ask['to_agent']} --text '...'. "
+                    f"agent-bus answer --thread-id {ask['thread_id']} --from {ask['to_agent']} --text '...'. "
                     f"Otherwise reply now."
                 )
                 # The sender's row for a remote ask is namespaced

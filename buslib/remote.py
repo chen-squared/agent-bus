@@ -158,7 +158,7 @@ def _handoff_peer(peer, message_row: dict[str, Any], timeout: int = 10) -> tuple
 def sweep_outbox(conn: sqlite3.Connection, limit: int = 3, timeout: int = 3) -> tuple[int, int]:
     """Claim and retry a few outbox rows. Called by the notifier so
     store-and-forward does not depend on an operator remembering
-    `bus outbox flush`. Claims are a status transition under a write lock, so
+    `agent-bus outbox flush`. Claims are a status transition under a write lock, so
     two notifiers cannot send the same row; a crashed claim is reclaimed after
     a lease. Remote dedupe makes the retry itself idempotent."""
     now_ts = now()

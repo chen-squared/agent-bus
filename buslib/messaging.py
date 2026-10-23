@@ -250,7 +250,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         peer_row = conn.execute("SELECT * FROM peers WHERE peer_name=?", (remote_peer,)).fetchone()
         if peer_row is None:
             conn.close()
-            raise SystemExit(f"error: unknown peer {remote_peer!r}; run `bus peer add`")
+            raise SystemExit(f"error: unknown peer {remote_peer!r}; run `agent-bus peer add`")
         args.to_agent = remote_to
         target_stale = False
     else:
@@ -512,11 +512,11 @@ def cmd_ask(args: argparse.Namespace) -> int:
             break
         time.sleep(0.5)
     if stale:
-        print(json_dumps({"ok": False, "stale": True, "message_id": message_id, "thread_id": thread_id, "hint": f"bus thread {thread_id}"}))
+        print(json_dumps({"ok": False, "stale": True, "message_id": message_id, "thread_id": thread_id, "hint": f"agent-bus thread {thread_id}"}))
     elif answer_row is not None:
         print(json_dumps({"ok": True, "message_id": message_id, "thread_id": thread_id, "answer": row_to_dict(answer_row)}))
     else:
-        print(json_dumps({"ok": True, "timeout": True, "message_id": message_id, "thread_id": thread_id, "hint": f"bus thread {thread_id}"}))
+        print(json_dumps({"ok": True, "timeout": True, "message_id": message_id, "thread_id": thread_id, "hint": f"agent-bus thread {thread_id}"}))
     conn.close()
     return 0
 

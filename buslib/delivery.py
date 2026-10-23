@@ -115,7 +115,7 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
             # rounds inside the same latest window would otherwise collide on
             # this id, and commit_group_digest's INSERT OR IGNORE silently drops
             # the second row: the text still reaches the adapter, but
-            # `bus message show` on that pointer returns not found.
+            # `agent-bus message show` on that pointer returns not found.
             "message_id": f"group-digest-{g['group_id']}-{last}-{agent_id}",
             "from_agent": f"{g['group_id']}",
             # CommandAdapter reads message["to_agent"] for the agent_id

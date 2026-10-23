@@ -259,7 +259,7 @@ Ack semantics:
 
 If an agent lacks a direct session API, inbox files and daemon endpoints work as fallback.
 
-Production sweep owner: the notifier started by `agent-bus up` also sweeps every 10s by default (`AGENT_BUS_SWEEP_INTERVAL`); standalone watchers must arrange `agent-bus sweep` every 30–60s. State is not deleted automatically: run `bus prune --agent-id <you> --days 30` (add `--dry-run` first) for retention, and rotate `bus_audit.log`/notifier logs with normal logrotate. The DB, WAL, token directory, blob directory, and audit log are created private (0600/0700); existing files are tightened on the next command.
+Production sweep owner: the notifier started by `agent-bus up` also sweeps every 10s by default (`AGENT_BUS_SWEEP_INTERVAL`); standalone watchers must arrange `agent-bus sweep` every 30–60s. State is not deleted automatically: run `agent-bus prune --agent-id <you> --days 30` (add `--dry-run` first) for retention, and rotate `bus_audit.log`/notifier logs with normal logrotate. The DB, WAL, token directory, blob directory, and audit log are created private (0600/0700); existing files are tightened on the next command.
 
 ### Core rule
 Group digest self-exclusion: senders do not digest their own messages; the scan window (40) is wider than the 5-row render budget, and an own-only window advances the cursor to the scan end so external messages are not starved. The watch re-run must arrive with fresh traffic above the cursor.
