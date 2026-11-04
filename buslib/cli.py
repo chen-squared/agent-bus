@@ -30,6 +30,7 @@ from .remote import (
     cmd_outbox_flush, cmd_outbox_list, cmd_peer_add, cmd_peer_list,
     cmd_peer_remove, cmd_status,
 )
+from .cursor_wake import add_parser as add_cursor_parser
 from .skill import cmd_skill_install, cmd_skill_path, cmd_skill_show
 from .validation import nonneg_float, nonneg_int, validate_id
 
@@ -111,6 +112,8 @@ def main() -> int:
     si.add_argument("--force", action="store_true", help="replace an existing different skill or launcher")
     si.add_argument("--dry-run", action="store_true", help="report what would change without writing")
     si.set_defaults(func=cmd_skill_install)
+
+    add_cursor_parser(sub)
 
     p = sub.add_parser("register", help="register or update agent")
     p.add_argument("--agent-id", required=True)

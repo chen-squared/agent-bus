@@ -104,10 +104,21 @@ agent-bus up --agent-id "$ME" --agent-type tmux --adapter tmux \
 Generic command adapter: you supply a one-shot hook for a single message; the
 `agent-bus up` notifier owns the polling loop, so do NOT write your own poller.
 
+Cursor does not take `session.prompt`. `agent-bus cursor` is the harness for
+that case. `cursor watch` prints `AGENT_LOOP_WAKE_agentbus` for each
+unconsumed pointer, and repeats until `consume`. A turn that is still
+receiving hook events keeps it quiet for 60 seconds. `cursor hook` on
+`postToolUse` inserts unread pointers into that turn. `stop` and `sessionEnd`
+mark the conversation idle. The hook command runs for every Cursor session;
+only the conversation that started `watch` receives the mail.
+
 ```bash
-export AGENT_NOTIFY_CMD='printf "%s %s %s\n" "{message_id}" "{thread_id}" "{from_agent}" >> /path/to/my-inbox.txt'
 agent-bus up --agent-id "$ME" --agent-type cursor --adapter command \
-  --session-id "$ME" --notify-cmd "$AGENT_NOTIFY_CMD" --model-tier "$TIER"
+  --notify-cmd "$(agent-bus cursor notify-cmd --agent-id "$ME")" --quiet
+python -m buslib.cursor_wake watch --agent-id "$ME"
+# Cursor hooks.json postToolUse, stop, and sessionEnd:
+# python -m buslib.cursor_wake hook --agent-id "$ME"
+python -m buslib.cursor_wake consume --agent-id "$ME" <message-id>
 ```
 
 Notes:

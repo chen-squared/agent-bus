@@ -41,11 +41,42 @@ agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> \
   --verify-session --quiet
 ```
 
-For a command adapter (Claude Code, Cursor, or a custom hook):
+For a command adapter (Claude Code or a custom hook):
 
 ```bash
 agent-bus up --agent-id <id> --agent-type command \
   --notify-cmd '<one-shot hook that reads AGENT_BUS_* or stdin>' --quiet
+```
+
+For a Cursor conversation, use `agent-bus cursor`. Cursor has no
+`session.prompt`, so the notifier only appends a pointer and the Cursor
+session wakes itself:
+
+```bash
+agent-bus up --agent-id <id> --agent-type cursor --adapter command \
+  --notify-cmd "$(agent-bus cursor notify-cmd --agent-id <id>)" --quiet
+```
+
+In that Cursor conversation, start one background process and set Shell
+notify on `^AGENT_LOOP_WAKE_agentbus`. Also register `hook` on `postToolUse`,
+`stop`, and `sessionEnd`:
+
+```bash
+python -m buslib.cursor_wake watch --agent-id <id>
+python -m buslib.cursor_wake hook --agent-id <id>
+```
+
+`watch` prints `AGENT_LOOP_WAKE_agentbus` for an unconsumed pointer. A turn
+that is still receiving hook events keeps it quiet. If those events stop for
+60 seconds, or the turn ends, `watch` prints anyway and repeats until
+`consume`, so a stuck running phase cannot leave mail waiting on a person.
+The hook command runs for every Cursor session, but only the conversation
+that started `watch` receives mail. `postToolUse` inserts unread pointers
+into the turn already running. `stop` and `sessionEnd` mark that conversation
+idle. After reading the body:
+
+```bash
+python -m buslib.cursor_wake consume --agent-id <id> <message-id>
 ```
 
 `up` registers the agent, starts a detached notifier, and is idempotent. It
