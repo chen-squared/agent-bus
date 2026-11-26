@@ -661,6 +661,13 @@ One-command start (registers the agent and starts a detached notifier):
   agent-bus up --agent-id <id> --agent-type command --notify-cmd '<your hook>'
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> --daemon
 
+Cursor watch (run inside the target Cursor conversation via backgrounded Shell,
+block_until_ms=0, notify_on_output='^AGENT_LOOP_WAKE_agentbus'; do NOT redirect
+stdout or detach with &/nohup, and keep --agent-id/--state-dir identical across
+notify-cmd, hooks.json, watch, and consume):
+  python -u -m buslib.cursor_wake watch --agent-id <id> [--state-dir <dir>]
+  python -m buslib.cursor_wake consume --agent-id <id> [--state-dir <dir>] <message-id>
+
 Check:
   agent-bus home
   agent-bus agents

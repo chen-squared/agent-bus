@@ -49,35 +49,70 @@ agent-bus up --agent-id <id> --agent-type command \
 ```
 
 For a Cursor conversation, use `agent-bus cursor`. Cursor has no
-`session.prompt`, so the notifier only appends a pointer and the Cursor
-session wakes itself:
+`session.prompt`, so the notifier only appends a pointer to `inbox.txt` and
+the Cursor session wakes itself.
 
-```bash
-agent-bus up --agent-id <id> --agent-type cursor --adapter command \
-  --notify-cmd "$(agent-bus cursor notify-cmd --agent-id <id>)" --quiet
-```
+1. **Start the notifier** (pass `--state-dir <dir>` here and in every step below
+   if you do not use the default `~/.local/share/agent-bus-cursor/<id>`):
 
-In that Cursor conversation, start one background process and set Shell
-notify on `^AGENT_LOOP_WAKE_agentbus`. Also register `hook` on `postToolUse`,
-`stop`, and `sessionEnd`:
+   ```bash
+   agent-bus up --agent-id <id> --agent-type cursor --adapter command \
+     --notify-cmd "$(agent-bus cursor notify-cmd --agent-id <id>)" --quiet
+   ```
 
-```bash
-python -m buslib.cursor_wake watch --agent-id <id>
-python -m buslib.cursor_wake hook --agent-id <id>
-```
+2. **Register global Cursor hooks** (`~/.cursor/hooks.json` under `postToolUse`,
+   `stop`, and `sessionEnd`) for each Cursor agent's exact `--agent-id` (and
+   `--state-dir` if custom):
 
-`watch` prints `AGENT_LOOP_WAKE_agentbus` for an unconsumed pointer. A turn
-that is still receiving hook events keeps it quiet. If those events stop for
-60 seconds, or the turn ends, `watch` prints anyway and repeats until
-`consume`, so a stuck running phase cannot leave mail waiting on a person.
-The hook command runs for every Cursor session, but only the conversation
-that started `watch` receives mail. `postToolUse` inserts unread pointers
-into the turn already running. `stop` and `sessionEnd` mark that conversation
-idle. After reading the body:
+   ```bash
+   /path/to/python -m buslib.cursor_wake hook --agent-id <id> [--state-dir <dir>]
+   ```
 
-```bash
-python -m buslib.cursor_wake consume --agent-id <id> <message-id>
-```
+   `~/.cursor/hooks.json` is shared across all Cursor conversations. Each hook
+   only binds `conversation_id` when that conversation launches `watch` with the
+   matching `--agent-id` (and `--state-dir` if specified). Non-`watch` commands
+   (`pending`, `consume`, `pgrep`) never bind or steal another session.
+
+3. **Launch `watch` in the target Cursor conversation** (most common mistake
+   area — follow every rule):
+
+   ```bash
+   /path/to/python -u -m buslib.cursor_wake watch --agent-id <id> [--state-dir <dir>]
+   ```
+
+   - **Background via the Shell tool (`block_until_ms: 0`)** — do NOT append
+     `&`, `nohup`, `setsid`, or `disown` inside bash. If the shell command exits
+     immediately, the harness closes the job and stops listening.
+   - **Must enable `notify_on_output`** on that Shell call with regex pattern
+     `^AGENT_LOOP_WAKE_agentbus`. If you background the process without
+     `notify_on_output`, printed wake lines sit unread in the terminal buffer
+     and never enter the session.
+   - **Do NOT redirect or pipe stdout/stderr** (`> watch.log`, `>/dev/null`,
+     `2>&1 >/dev/null`, `| tee ...`). `notify_on_output` watches the live
+     stdout stream of that Shell call; redirecting stdout to a file or
+     `/dev/null` silences all wakes.
+   - **Use `-u`** so Python stdout is unbuffered, and run `watch` inside the
+     actual Cursor conversation you want to wake (never in an external
+     terminal, or `postToolUse` will not bind `conversation_id`).
+   - **Run only one `watch` per `--agent-id` / `--state-dir`**. Check with
+     `pgrep -af "cursor_wake watch"` if unsure; if a long-lived background Shell
+     exits (e.g., 24h timeout), re-launch it in that same conversation with
+     `block_until_ms: 0` and `notify_on_output`.
+
+How the two wake paths work together:
+`watch` prints `AGENT_LOOP_WAKE_agentbus ...` for each unconsumed pointer when
+the conversation is idle (`stop`/`sessionEnd`, or 60s without hook events), and
+repeats every 60 seconds until `consume`. While a turn is actively running tool
+calls, `postToolUse` keeps `watch` quiet and injects `additional_context`
+directly into that bound turn.
+
+4. **Handle and `consume` every pointer** (in addition to `agent-bus ack`):
+
+   ```bash
+   /path/to/python -m buslib.cursor_wake consume --agent-id <id> [--state-dir <dir>] <message-id>
+   ```
+
+   Skipping `consume` leaves the pointer pending so `watch` repeats every 60s.
 
 `up` registers the agent, starts a detached notifier, and is idempotent. It
 prints JSON on stdout; audit events go to stderr. Check the binding with:

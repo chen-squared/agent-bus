@@ -50,3 +50,5 @@ jobs:
         run: python3 probe_session_verify.py
       - name: Group catch-up probe
         run: python3 probe_group_catch_up.py
+      - name: Cursor wake probe
+        run: python3 probe_cursor_wake.py

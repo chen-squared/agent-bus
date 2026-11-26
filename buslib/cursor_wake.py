@@ -2,11 +2,16 @@
 
 The notifier appends one pointer line to inbox.txt.
 
-- ``watch`` prints ``AGENT_LOOP_WAKE_agentbus`` for each unconsumed pointer.
-  A turn that is still receiving hook events keeps it quiet. If those events
-  stop, ``watch`` prints anyway after ``HOLD_S`` and repeats until ``consume``.
+- ``watch`` prints ``AGENT_LOOP_WAKE_agentbus`` to stdout for each unconsumed
+  pointer. Run it unbuffered (``python -u``) inside the target Cursor
+  conversation with background output monitoring (``notify_on_output`` on
+  ``^AGENT_LOOP_WAKE_agentbus``), and do NOT redirect stdout or detach with
+  ``&``/``nohup``. A turn still receiving hook events keeps it quiet. If those
+  events stop, ``watch`` prints anyway after ``HOLD_S`` and repeats until
+  ``consume``.
 - ``hook`` runs for every Cursor session, and only the conversation that
-  started ``watch`` gets mail. ``postToolUse`` inserts unread pointers into
+  started ``watch`` for that exact ``--agent-id`` (and ``--state-dir`` when
+  specified) binds and gets mail. ``postToolUse`` inserts unread pointers into
   the turn already in progress and refreshes that heartbeat. ``stop`` and
   ``sessionEnd`` mark the conversation idle so ``watch`` can print.
 
@@ -29,8 +34,14 @@ from pathlib import Path
 WAKE_PREFIX = "AGENT_LOOP_WAKE_agentbus "
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,80}")
 FROM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9@_.-]{0,120}")
-WATCH_MARKERS = ("cursor_wake", "cursor watch", "dev-cursor-bus/wake.py")
 HOLD_S = 60.0
+
+_ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+_PYTHON_EXE_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
+_REDIR_OPS = {">", ">>", "<", "<<", "<<<", ">&", "<&", "<>", "&>", "&>>", ">|"}
+_CONTROL_OPS = {";", "&&", "||", "|", "&", "\n", "(", ")", ";;"}
+_CURSOR_SUBCOMMANDS = {"watch", "hook", "consume", "pending", "notify-cmd"}
+_SHELL_NAMES = {"sh", "bash", "zsh", "dash"}
 
 
 def default_state_dir(agent_id: str) -> Path:
@@ -232,26 +243,392 @@ def _tool_command(event: dict) -> str:
     return ""
 
 
-def _consume_ids(command: str) -> list[str]:
+def _strip_line_continuations(command: str) -> str:
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            if i + 1 < n and command[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 2 < n and command[i + 1] == "\r" and command[i + 2] == "\n":
+                i += 3
+                continue
+            if i + 1 < n:
+                out.append(ch)
+                out.append(command[i + 1])
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _split_shell_segments(command: str) -> list[list[str]]:
+    if not command.strip():
+        return []
+    lex = shlex.shlex(_strip_line_continuations(command), posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace_split = True
+    lex.whitespace = " \t\r"
     try:
-        tokens = shlex.split(command)
+        tokens = list(lex)
     except ValueError:
         return []
-    if "--consume" not in tokens and "consume" not in tokens:
-        return []
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for tok in tokens:
+        if tok in _CONTROL_OPS:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _strip_redirections(tokens: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok in {"0", "1", "2"} and i + 1 < n and tokens[i + 1] in _REDIR_OPS:
+            i += 2
+            if i < n and tokens[i] not in _REDIR_OPS:
+                i += 1
+            continue
+        if tok in _REDIR_OPS:
+            i += 1
+            if i < n and tokens[i] not in _REDIR_OPS:
+                i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _unwrap_wrappers(tokens: list[str]) -> tuple[dict[str, str], list[str]]:
+    env_vars: dict[str, str] = {}
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if _ENV_ASSIGN_RE.fullmatch(tok):
+            key, val = tok.split("=", 1)
+            env_vars[key] = val
+            i += 1
+            continue
+        name = Path(tok).name
+        if name == "env":
+            i += 1
+            while i < n:
+                t = tokens[i]
+                if t in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}:
+                    i += 2
+                    continue
+                if t.startswith("-"):
+                    i += 1
+                    continue
+                if _ENV_ASSIGN_RE.fullmatch(t):
+                    key, val = t.split("=", 1)
+                    env_vars[key] = val
+                    i += 1
+                    continue
+                break
+            continue
+        if name in {"nohup", "setsid"}:
+            i += 1
+            continue
+        if name == "exec":
+            i += 1
+            while i < n and tokens[i].startswith("-"):
+                if tokens[i] == "-a":
+                    i += 2
+                else:
+                    i += 1
+            continue
+        if name == "command":
+            i += 1
+            while i < n and tokens[i] in {"-p", "-v", "-V", "--"}:
+                if tokens[i] == "--":
+                    i += 1
+                    break
+                i += 1
+            continue
+        if name == "stdbuf":
+            i += 1
+            while i < n and tokens[i].startswith("-"):
+                if tokens[i] in {"-i", "-o", "-e"}:
+                    i += 2
+                else:
+                    i += 1
+            continue
+        break
+    return env_vars, tokens[i:]
+
+
+def _shell_inline_script(args: list[str]) -> str | None:
+    saw_c = False
+    i = 0
+    n = len(args)
+    while i < n:
+        tok = args[i]
+        if tok == "--":
+            i += 1
+            break
+        if tok.startswith("-") and not tok.startswith("--"):
+            if "c" in tok[1:]:
+                saw_c = True
+            i += 1
+            continue
+        if tok.startswith("--"):
+            i += 1
+            continue
+        break
+    if saw_c and i < n:
+        return args[i]
+    return None
+
+
+def _is_legacy_wake_script(path_str: str) -> bool:
+    normalized = path_str.replace("\\", "/")
+    if normalized == "dev-cursor-bus/wake.py" or normalized.endswith("/dev-cursor-bus/wake.py"):
+        return True
+    try:
+        target = Path.home() / ".local" / "share" / "dev-cursor-bus" / "wake.py"
+        return Path(path_str).expanduser().resolve(strict=False) == target.resolve(strict=False)
+    except OSError:
+        return False
+
+
+def _is_bus_cli_script(path_str: str) -> bool:
+    return Path(path_str).name in {"bus.py", "cli.py"}
+
+
+def _parse_agent_bus_cli(args: list[str], env_vars: dict[str, str]) -> tuple[str, list[str], dict[str, str]] | None:
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--db":
+            i += 2
+            continue
+        if tok.startswith("--db="):
+            i += 1
+            continue
+        break
+    if i + 1 < len(args) and args[i] == "cursor" and args[i + 1] in _CURSOR_SUBCOMMANDS:
+        return args[i + 1], args[i + 2 :], env_vars
+    return None
+
+
+def _parse_legacy_wake(args: list[str], env_vars: dict[str, str]) -> tuple[str, list[str], dict[str, str]] | None:
+    common = [
+        "--agent-id",
+        "dev-cursor",
+        "--state-dir",
+        str(Path.home() / ".local" / "share" / "dev-cursor-bus"),
+    ]
+    if not args:
+        return "watch", common, env_vars
+    if args[0] == "hook":
+        return "hook", common, env_vars
+    if args[0] == "--consume":
+        return "consume", [*common, *args[1:]], env_vars
+    if args[0] == "--pending":
+        return "pending", common, env_vars
+    if args[0] in _CURSOR_SUBCOMMANDS:
+        return args[0], args[1:], env_vars
+    return None
+
+
+def _parse_python_module(module: str, rest: list[str], env_vars: dict[str, str]) -> tuple[str, list[str], dict[str, str]] | None:
+    if module == "buslib.cursor_wake":
+        if rest and rest[0] in _CURSOR_SUBCOMMANDS:
+            return rest[0], rest[1:], env_vars
+        return None
+    if module == "buslib.cli":
+        return _parse_agent_bus_cli(rest, env_vars)
+    return None
+
+
+def _parse_script_invocation(script_path: str, args: list[str], env_vars: dict[str, str]) -> tuple[str, list[str], dict[str, str]] | None:
+    if _is_legacy_wake_script(script_path):
+        return _parse_legacy_wake(args, env_vars)
+    if Path(script_path).name == "cursor_wake.py":
+        if args and args[0] in _CURSOR_SUBCOMMANDS:
+            return args[0], args[1:], env_vars
+        return None
+    if _is_bus_cli_script(script_path):
+        return _parse_agent_bus_cli(args, env_vars)
+    return None
+
+
+def _parse_cursor_invocation(env_vars: dict[str, str], tokens: list[str]) -> tuple[str, list[str], dict[str, str]] | None:
+    if not tokens:
+        return None
+    exe_name = Path(tokens[0]).name
+    if _PYTHON_EXE_RE.fullmatch(exe_name):
+        i = 1
+        n = len(tokens)
+        while i < n:
+            tok = tokens[i]
+            if tok == "--":
+                i += 1
+                break
+            if tok == "-c" or tok.startswith("-c"):
+                return None
+            if tok == "-m":
+                if i + 1 >= n:
+                    return None
+                return _parse_python_module(tokens[i + 1], tokens[i + 2 :], env_vars)
+            if tok.startswith("-m") and len(tok) > 2:
+                return _parse_python_module(tok[2:], tokens[i + 1 :], env_vars)
+            if tok.startswith("-") and not tok.startswith("--"):
+                flags = tok[1:]
+                if "c" in flags:
+                    return None
+                if "m" in flags:
+                    idx = flags.index("m")
+                    if idx + 1 < len(flags):
+                        return _parse_python_module(flags[idx + 1 :], tokens[i + 1 :], env_vars)
+                    if i + 1 >= n:
+                        return None
+                    return _parse_python_module(tokens[i + 1], tokens[i + 2 :], env_vars)
+                if tok in {"-W", "-X"}:
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if tok == "--check-hash-based-pycs":
+                i += 2
+                continue
+            if tok.startswith("--"):
+                i += 1
+                continue
+            return _parse_script_invocation(tok, tokens[i + 1 :], env_vars)
+        if i < n:
+            return _parse_script_invocation(tokens[i], tokens[i + 1 :], env_vars)
+        return None
+    if exe_name in {"agent-bus", "run"} or _is_bus_cli_script(tokens[0]):
+        return _parse_agent_bus_cli(tokens[1:], env_vars)
+    if _is_legacy_wake_script(tokens[0]):
+        return _parse_legacy_wake(tokens[1:], env_vars)
+    if Path(tokens[0]).name == "cursor_wake.py":
+        if len(tokens) >= 2 and tokens[1] in _CURSOR_SUBCOMMANDS:
+            return tokens[1], tokens[2:], env_vars
+    return None
+
+
+def _iter_invocations(command: str, depth: int = 0):
+    if depth > 2 or not command:
+        return
+    shell_env: dict[str, str] = {}
+    for seg in _split_shell_segments(command):
+        clean = _strip_redirections(seg)
+        env_vars, cmd = _unwrap_wrappers(clean)
+        if not cmd:
+            shell_env.update(env_vars)
+            continue
+        if cmd[0] == "export":
+            for arg in cmd[1:]:
+                if _ENV_ASSIGN_RE.fullmatch(arg):
+                    key, val = arg.split("=", 1)
+                    shell_env[key] = val
+            continue
+        merged_env = {**shell_env, **env_vars}
+        if Path(cmd[0]).name in _SHELL_NAMES:
+            inner = _shell_inline_script(cmd[1:])
+            if inner is not None:
+                yield from _iter_invocations(inner, depth + 1)
+            continue
+        parsed = _parse_cursor_invocation(merged_env, cmd)
+        if parsed is not None:
+            yield parsed
+
+
+def _extract_store_match(store: Store, sub_args: list[str], env_vars: dict[str, str]) -> tuple[bool, list[str]]:
+    agent_id: str | None = None
+    state_dir: str | None = None
+    positionals: list[str] = []
+    i = 0
+    n = len(sub_args)
+    while i < n:
+        tok = sub_args[i]
+        if tok == "--agent-id" and i + 1 < n:
+            agent_id = sub_args[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--agent-id="):
+            agent_id = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if tok == "--state-dir" and i + 1 < n:
+            state_dir = sub_args[i + 1]
+            i += 2
+            continue
+        if tok.startswith("--state-dir="):
+            state_dir = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if tok == "--":
+            positionals.extend(sub_args[i + 1 :])
+            break
+        if tok.startswith("-"):
+            i += 1
+            continue
+        positionals.append(tok)
+        i += 1
+    if agent_id != store.agent_id:
+        return False, []
+    effective_state_dir = state_dir if state_dir is not None else env_vars.get("AGENT_BUS_WAKE_HOME")
+    if effective_state_dir is not None:
+        try:
+            cmd_dir = Path(effective_state_dir).expanduser().resolve(strict=False)
+            store_dir = store.state_dir.expanduser().resolve(strict=False)
+        except OSError:
+            return False, []
+        if cmd_dir != store_dir:
+            return False, []
+    return True, positionals
+
+
+def _is_watch_command(store: Store, command: str) -> bool:
+    for subcmd, sub_args, env_vars in _iter_invocations(command):
+        if subcmd != "watch":
+            continue
+        matched, _ = _extract_store_match(store, sub_args, env_vars)
+        if matched:
+            return True
+    return False
+
+
+def _consume_ids(store: Store, command: str) -> list[str]:
     ids: list[str] = []
-    skip_next = False
-    for token in tokens:
-        if skip_next:
-            skip_next = False
+    for subcmd, sub_args, env_vars in _iter_invocations(command):
+        if subcmd != "consume":
             continue
-        if token in {"--agent-id", "--state-dir"}:
-            skip_next = True
+        matched, positionals = _extract_store_match(store, sub_args, env_vars)
+        if not matched:
             continue
-        if token.startswith("-") or token in {"consume", "watch", "hook", "cursor"}:
-            continue
-        if ID_RE.fullmatch(token):
-            ids.append(token)
+        for token in positionals:
+            if ID_RE.fullmatch(token):
+                ids.append(token)
     return ids
 
 
@@ -273,12 +650,12 @@ def hook(store: Store, event: dict | None = None) -> dict:
         data = store.read_state()
         command = _tool_command(event)
         changed = False
-        if name == "postToolUse" and any(marker in command for marker in WATCH_MARKERS) and "--consume" not in command and conversation_id:
+        if name == "postToolUse" and conversation_id and _is_watch_command(store, command):
             if data.get("conversation_id") != conversation_id:
                 data["conversation_id"] = conversation_id
                 changed = True
                 store.log(f"bind conversation={conversation_id}")
-        for message_id in _consume_ids(command):
+        for message_id in _consume_ids(store, command):
             if message_id not in data["consumed"]:
                 data["consumed"].append(message_id)
                 changed = True
@@ -370,10 +747,22 @@ def _add_common(command: argparse.ArgumentParser) -> None:
     command.add_argument("--state-dir", help="pointer directory (default: ~/.local/share/agent-bus-cursor/<agent-id>)")
 
 
+_WATCH_DESC = (
+    "Print AGENT_LOOP_WAKE_agentbus lines to stdout while the conversation is idle. "
+    "Launch inside the target Cursor conversation as a backgrounded Shell call "
+    "(block_until_ms=0) with notify_on_output matching '^AGENT_LOOP_WAKE_agentbus'. "
+    "Do NOT redirect stdout/stderr (> file, >/dev/null) or detach with & / nohup."
+)
+
+
 def add_parser(sub: argparse._SubParsersAction) -> None:
     parser = sub.add_parser("cursor", help="wake a Cursor conversation from the command adapter")
     commands = parser.add_subparsers(dest="cursor_command", required=True)
-    watch_p = commands.add_parser("watch", help="print AGENT_LOOP_WAKE_agentbus while the conversation is idle")
+    watch_p = commands.add_parser(
+        "watch",
+        help="print AGENT_LOOP_WAKE_agentbus while the conversation is idle",
+        description=_WATCH_DESC,
+    )
     _add_common(watch_p)
     watch_p.set_defaults(func=cmd_watch)
     hook_p = commands.add_parser("hook", help="Cursor postToolUse, stop, and sessionEnd; reads the event on stdin")
@@ -401,7 +790,8 @@ def main(argv: list[str] | None = None) -> int:
         ("pending", cmd_pending, False),
         ("notify-cmd", cmd_notify_cmd, False),
     ):
-        command = sub.add_parser(name)
+        kwargs = {"description": _WATCH_DESC} if name == "watch" else {}
+        command = sub.add_parser(name, **kwargs)
         command.add_argument("--agent-id", required=True)
         command.add_argument("--state-dir")
         if ids:
