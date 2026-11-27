@@ -22,7 +22,7 @@ jobs:
           python3 -m pyflakes buslib/*.py buslib/adapters/*.py buslib/daemon/*.py buslib/skills/*.py bus_agent.py bus_daemon.py bus_ssh_gateway.py probe_*.py
       - name: Package install smoke
         run: |
-          python3 -m pip install --quiet --no-deps .
+          python3 -m pip install --quiet .
           agent-bus --help >/dev/null
           agent-bus-daemon --help >/dev/null
           agent-bus-notifier --help >/dev/null
@@ -52,3 +52,5 @@ jobs:
         run: python3 probe_group_catch_up.py
       - name: Cursor wake probe
         run: python3 probe_cursor_wake.py
+      - name: Codex wake probe
+        run: python3 probe_codex_wake.py

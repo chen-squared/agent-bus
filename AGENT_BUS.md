@@ -253,13 +253,14 @@ each notifier process is restarted — verify fixes on freshly started processes
 since a running process is a frozen snapshot of the code at its start time.
 
 ```sh
-agent-bus up --agent-id <id> --adapter <opencode|tmux|command> \
+agent-bus up --agent-id <id> --adapter <opencode|codex|tmux|command> \
   --session-id <id> [--tmux-target <pane>] [--notify-cmd '<hook>']
 ```
 
 Adapters:
 
 - `opencode`: uses `opencode api session.prompt` (reference implementation).
+- `codex`: steers the active turn of the thread UUID or queues a pointer via `codex queue --resume`. See [Codex wake](README.md#codex-wake) for setup.
 - `command`: runs `AGENT_NOTIFY_CMD` / `--notify-cmd`, subject to quoting needs. Preferred generic path; let the agent monitor an inbox file or hook.
 - `tmux`: uses tmux send-keys; checks idle before injecting (final fallback only; less reliable because terminal injection can race typing).
 
@@ -268,7 +269,8 @@ Environment variables:
 - `AGENT_BUS_AGENT` default sender identity
 - `AGENT_BUS_DB` database path
 - `AGENT_BUS_ADAPTER` adapter type
-- `AGENT_BUS_SESSION` OpenCode session id
+- `AGENT_BUS_SESSION` OpenCode session ID or Codex thread UUID
+- `AGENT_BUS_CODEX_REMOTE` optional Codex app-server endpoint
 - `TMUX_TARGET` tmux pane
 - `AGENT_NOTIFY_CMD` generic command template
   Placeholders: `{agent_id}`, `{session_id}`, `{from_agent}`, `{message_id}`,
@@ -441,7 +443,7 @@ id charset rejection, dlq retry expiry reset, peer token masking, outbox max_att
 ask/answer idempotency, 8-way concurrent group send, heartbeat non-rebinding, gateway
 allowlist bypasses, daemon importability, 1:1 send/inbox/ack smoke); all three
 drive the real CLI against a throwaway DB and token dir and must stay green.
-For non-opencode agents, use `command` adapter as the blessed generic watcher; tmux remains final fallback.
+The `command` adapter supports agents that use inbox files or hooks. The `tmux` adapter remains the fallback for terminal delivery.
 
 
 ### Trust boundary

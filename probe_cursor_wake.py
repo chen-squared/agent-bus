@@ -3,11 +3,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from threading import Event
+from unittest.mock import patch
 
-from buslib.cursor_wake import HOLD_S, Store, _consume_ids, _is_watch_command, consume, drain_once, hook
+from buslib.cursor_wake import HOLD_S, WAKE_PREFIX, Store, _is_watch_command, consume, default_state_dir, drain_once, hook
 
 FAIL: list[str] = []
 NEW = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee 11111111-2222-3333-4444-555555555555 other@peer\n"
@@ -33,11 +39,13 @@ def main() -> None:
 def _run(root: Path, iso_root: Path) -> None:
     store = Store("dev-cursor", root)
     store.inbox.write_text(OLD)
-    store.seed()
-    check("first watch consumes the inbox it found", store.pending(store.read_state()) == [])
+    store.initialize()
+    old_id = OLD.split()[0]
+    check("first watch keeps pointers already written", [row["id"] for row in store.pending(store.read_state())] == [old_id])
+    consume(store, [old_id])
 
     new_id = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
-    store.inbox.write_text(OLD + NEW)
+    store.inbox.write_text(OLD + NEW + NEW)
     base = 1_000_000.0
     store.write_state({**store.read_state(), "phase": "running", "phase_at": base})
     check("a live turn does not print", drain_once(store, now=base + 10) == [])
@@ -46,14 +54,18 @@ def _run(root: Path, iso_root: Path) -> None:
     check("the same pointer is not repeated inside the hold", drain_once(store, now=base + HOLD_S + 1) == [])
     again = drain_once(store, now=base + 2 * HOLD_S + 2)
     check("an unread pointer wakes again after the hold", [row["id"] for row in again] == [new_id])
+    consume(store, [new_id])
 
+    hook_id = "hook-message"
+    hook_pointer = f"{hook_id} thread other@peer\n"
+    store.inbox.write_text(NEW + hook_pointer)
     running = hook(store, {
         "hook_event_name": "postToolUse",
         "conversation_id": "conv-1",
         "generation_id": "g1",
-        "tool_input": {"command": "python -m buslib.cursor_wake watch --agent-id dev-cursor"},
+        "tool_input": {"command": f"python -m buslib.cursor_wake watch --agent-id dev-cursor --state-dir {root}"},
     })
-    check("postToolUse names the unread pointer", new_id in running.get("additional_context", ""))
+    check("postToolUse names the unread pointer", hook_id in running.get("additional_context", ""))
     check("a fresh heartbeat is quiet", drain_once(store) == [])
     check("another conversation gets nothing", hook(store, {"hook_event_name": "postToolUse", "conversation_id": "other", "generation_id": "g9", "tool_input": {"command": "echo hi"}}) == {})
     check("the same generation is not inserted twice", hook(store, {
@@ -62,6 +74,12 @@ def _run(root: Path, iso_root: Path) -> None:
         "generation_id": "g1",
         "tool_input": {"command": "echo later"},
     }) == {})
+    second_id = "new-in-the-same-turn"
+    store.inbox.write_text(NEW + hook_pointer + f"{second_id} thread other@peer\n")
+    new_notice = hook(store, {
+        "hook_event_name": "postToolUse", "conversation_id": "conv-1", "generation_id": "g1",
+    }).get("additional_context", "")
+    check("a changing pending list inserts only new IDs", second_id in new_notice and hook_id not in new_notice)
 
     stopped = hook(store, {"hook_event_name": "stop", "conversation_id": "conv-1", "status": "completed"})
     check("stop only marks the conversation idle", stopped == {} and store.read_state()["phase"] == "stopped")
@@ -69,17 +87,55 @@ def _run(root: Path, iso_root: Path) -> None:
     check("sessionEnd sends nothing", ended == {})
     other = hook(store, {"hook_event_name": "sessionEnd", "session_id": "someone-else"})
     check("another session ending does not unbind this one", other == {} and store.read_state()["conversation_id"] == "conv-1")
+    check("idle watcher does not repeat pointers just supplied by the hook", drain_once(store) == [])
 
-    consume(store, [new_id])
+    consume(store, [hook_id, second_id])
     check("consume drops that pointer", store.pending(store.read_state()) == [])
     check("a consumed pointer does not wake", drain_once(store) == [])
 
     fresh_id = "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee"
     fresh = f"{fresh_id} 11111111-2222-3333-4444-555555555555 other@peer\n"
-    store.inbox.write_text(store.inbox.read_text() + fresh)
-    woken = drain_once(store)
-    check("an idle watcher prints the new pointer", [row["id"] for row in woken] == [fresh_id])
+    long_agent = "a" * 64
+    long_group = "b" * 64
+    digest_id = f"group-digest-{long_group}-9223372036854775807-{long_agent}"
+    store.inbox.write_text(store.inbox.read_text() + fresh + f"{digest_id} {long_group} {long_agent}@{long_group}\n")
+    capture = StringIO()
+    with redirect_stdout(capture):
+        woken = drain_once(store)
+    check("an idle watcher batches direct and full-length digest IDs", [row["id"] for row in woken] == [fresh_id, digest_id])
+    check("the batch generates one wake line", capture.getvalue().count(WAKE_PREFIX) == 1)
     check("the wake line is not printed twice", drain_once(store) == [])
+    check("the watcher and hook share notice state", hook(store, {"hook_event_name": "postToolUse", "conversation_id": "conv-1"}) == {})
+    consume(store, [fresh_id, digest_id])
+    check("consume accepts full-length digest IDs", store.pending(store.read_state()) == [])
+
+    # Two watchers reading while the first is emitting used to deliver twice.
+    race_store = Store("dev-cursor", iso_root / "watch-race")
+    race_store.initialize()
+    race_store.inbox.write_text(NEW)
+    emitting = Event()
+    release = Event()
+
+    def slow_emit(_store, _rows):
+        emitting.set()
+        release.wait(2)
+
+    with patch("buslib.cursor_wake._emit", side_effect=slow_emit) as emit, ThreadPoolExecutor(2) as pool:
+        first = pool.submit(drain_once, race_store)
+        check("first watcher enters emission", emitting.wait(2))
+        with race_store.lock_path.open("a") as contender:
+            try:
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held_during_emission = True
+            else:
+                held_during_emission = False
+        check("a watcher holds the state lock while emitting", held_during_emission)
+        second = pool.submit(drain_once, race_store)
+        release.set()
+        first.result(2)
+        second.result(2)
+        check("concurrent watchers claim one wake", emit.call_count == 1)
 
     # Multi-session isolation: global hooks fire for every Cursor session, so
     # each hook must only bind and consume commands targeting its own agent/dir.
@@ -87,8 +143,8 @@ def _run(root: Path, iso_root: Path) -> None:
     reviewer_dir = iso_root / "dev-reviewer"
     cursor_store = Store("dev-cursor", cursor_dir)
     reviewer_store = Store("dev-reviewer", reviewer_dir)
-    cursor_store.seed()
-    reviewer_store.seed()
+    cursor_store.initialize()
+    reviewer_store.initialize()
 
     # Non-watch commands never bind either session.
     for cmd in (
@@ -146,6 +202,11 @@ def _run(root: Path, iso_root: Path) -> None:
     }
     hook(reviewer_store, ev_wrong_dir)
     check("mismatched state-dir does not rebind", reviewer_store.read_state()["conversation_id"] == "conv-reviewer")
+    implicit = "agent-bus cursor watch --agent-id dev-reviewer"
+    check("omitted state-dir matches only the default store", not _is_watch_command(reviewer_store, implicit)
+          and _is_watch_command(Store("dev-reviewer", default_state_dir("dev-reviewer")), implicit))
+    env_watch = f"env AGENT_BUS_WAKE_HOME={reviewer_dir} bash -lc '{implicit}'"
+    check("a nested watch inherits its state-dir override", _is_watch_command(reviewer_store, env_watch))
 
     # Unrelated pending message for dev-reviewer is NOT injected into dev-cursor's turn.
     rev_msg = "dddddddd-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -165,24 +226,26 @@ def _run(root: Path, iso_root: Path) -> None:
     })
     check("dev-reviewer turn receives its own mail", rev_msg in direct.get("additional_context", ""))
 
-    # Consume filtering: chained send + consume only marks target store and ignores unrelated words.
+    # A hook can see a command without it ever having been executed.
     cur_msg = "eeeeeeee-bbbb-cccc-dddd-eeeeeeeeeeee"
+    cursor_store.inbox.write_text(f"{cur_msg} thread sender\n")
     ev_consume = {
         "hook_event_name": "postToolUse",
         "conversation_id": "conv-cursor",
         "generation_id": "gc3",
         "tool_input": {
             "command": (
-                f"python -m buslib.cli send --from dev-cursor --to dev-opencode --text ok --idempotency-key k1 "
+                "false "
                 f"&& python -m buslib.cursor_wake consume --agent-id dev-cursor --state-dir {cursor_dir} {cur_msg}"
             )
         },
     }
     hook(cursor_store, ev_consume)
     hook(reviewer_store, ev_consume)
-    check("matching consume marks cursor_store only", cur_msg in cursor_store.read_state()["consumed"])
-    check("consume does not pollute cursor_store with send tokens", "k1" not in cursor_store.read_state()["consumed"] and "send" not in cursor_store.read_state()["consumed"])
-    check("consume for dev-cursor does not touch dev-reviewer", cur_msg not in reviewer_store.read_state()["consumed"])
+    check("a shell mention of consume leaves the pointer pending", cur_msg not in cursor_store.read_state()["consumed"])
+    consume(cursor_store, [cur_msg])
+    check("explicit consume updates only its target store", cur_msg in cursor_store.read_state()["consumed"]
+          and cur_msg not in reviewer_store.read_state()["consumed"])
 
     # Legacy wake.py wrapper only matches dev-cursor.
     legacy_root = Path.home() / ".local" / "share" / "dev-cursor-bus"
@@ -190,11 +253,7 @@ def _run(root: Path, iso_root: Path) -> None:
     check("legacy wake.py matches dev-cursor at dev-cursor-bus", _is_watch_command(legacy_store, f"python {legacy_root / 'wake.py'}"))
     check("legacy wake.py --pending is not a watch command", not _is_watch_command(legacy_store, f"python {legacy_root / 'wake.py'} --pending"))
     check("legacy wake.py does not match dev-reviewer", not _is_watch_command(reviewer_store, f"python {legacy_root / 'wake.py'}"))
-    check(
-        "legacy wake.py --consume only targets dev-cursor",
-        _consume_ids(legacy_store, f"python {legacy_root / 'wake.py'} --consume {cur_msg}") == [cur_msg]
-        and _consume_ids(reviewer_store, f"python {legacy_root / 'wake.py'} --consume {cur_msg}") == [],
-    )
+    check("legacy wake.py --consume does not bind", not _is_watch_command(legacy_store, f"python {legacy_root / 'wake.py'} --consume {cur_msg}"))
 
     if FAIL:
         raise SystemExit(f"{len(FAIL)} failed")

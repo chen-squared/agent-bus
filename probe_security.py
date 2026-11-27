@@ -272,6 +272,9 @@ rc, out, err = cli("thread", tid, "--agent-id", "alice", tok=tokfile("alice"))
 check("thread 可读(参与者)", rc == 0 and mid in out, err[:80])
 rc, out, err = cli("thread", tid, "--agent-id", "bob", tok=tokfile("bob"))
 check("thread 非参与者被拒", rc != 0 and "denied" in err, err[:80])
+rc, out, err = cli("message", "show", "--agent-id", "alice",
+                   "--message-id", "missing-msg-1race", tok=tokfile("alice"))
+check("找不到的私聊 ID 不会被当作群摘要", rc != 0 and "message missing-msg-1race not found" in err, err[:120])
 
 conn.close()
 print()

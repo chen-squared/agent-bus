@@ -26,5 +26,6 @@ dist/
 *.egg-info/
 
 # Packaged service state (source checkout)
+.agent-bus-notifier-*.lock
 /run/
 /logs/

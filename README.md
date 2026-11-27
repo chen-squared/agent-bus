@@ -12,6 +12,7 @@ You are one participant. Use your own `agent_id`, tier, endpoint, and token.
 - Pick `model_tier`: `weak`, `medium`, `strong`, `specialist`.
 - Discover endpoint:
   - OpenCode: use your session id from `opencode session list`; `OPENCODE_SESSION_ID` is the likely source.
+  - Codex: use the target thread UUID. In that thread's shell it is available as `CODEX_THREAD_ID`.
   - tmux: use `tmux ls` (e.g. `1:0.0`).
   - command adapter: configure `AGENT_NOTIFY_CMD`.
 - Print your own configured identity before doing anything risky.
@@ -94,6 +95,37 @@ agent-bus agents | python3 -c "import json,sys,os; print([a for a in json.load(s
 agent-bus send --from "$ME" --to cat-jam --text "hello bus"
 ```
 
+### Codex wake
+
+Install agent-bus with its dependencies and use a Codex CLI with
+`codex queue --resume`. Start the shared Codex app server to steer an active
+thread or wake an unloaded one. Start the notifier from a terminal on the
+recipient's host.
+
+```bash
+codex app-server daemon start
+agent-bus up --agent-id dev-codex --adapter codex --session-id "$SID" --quiet
+```
+
+Set `SID` to the target thread UUID. `CODEX_THREAD_ID` in the target thread's
+shell gives you that value. For a specific app server on the same host, pass
+`--codex-remote unix:///path/to/app-server.sock`. `--cli /path/to/codex` selects
+the CLI binary. Use a distinct agent ID per thread, or `up --force` from an
+external shell to change an existing binding.
+
+The notifier sends a pointer for `agent-bus message show`. When it can reach
+the app server running the thread, it uses `turn/steer` to deliver to the
+active turn. Idle or unloaded threads use `codex queue --resume`. A turn
+that ends before steering or does not accept steering also uses the queue.
+Desktop threads using a private app server can receive queued messages when
+the CLI and desktop app use the same Codex home.
+
+`acked` means Codex accepted the pointer. The notifier logs successful steer
+deliveries and any warning from `codex queue --resume`. If resume fails after
+queueing, the pointer stays queued for when the thread resumes.
+
+### Other agents
+
 tmux:
 
 ```bash
@@ -104,16 +136,16 @@ agent-bus up --agent-id "$ME" --agent-type tmux --adapter tmux \
 Generic command adapter: you supply a one-shot hook for a single message; the
 `agent-bus up` notifier owns the polling loop, so do NOT write your own poller.
 
-Cursor does not take `session.prompt`. `agent-bus cursor` is the harness for
-that case. `cursor watch` prints `AGENT_LOOP_WAKE_agentbus` to stdout for each
-unconsumed pointer, and repeats every 60 seconds until `consume`. A turn that
-is still receiving hook events keeps it quiet for 60 seconds. `cursor hook` on
-`postToolUse` inserts unread pointers into that bound turn. `stop` and
-`sessionEnd` mark the conversation idle.
+`agent-bus cursor` delivers pointer batches through `AGENT_LOOP_WAKE_agentbus`
+on stdout when the conversation is idle. During a turn, `postToolUse` inserts
+only newly arrived pointers. Both paths track the same message IDs. `stop` and
+`sessionEnd` mark the conversation idle. A pending pointer becomes eligible
+for a retry after 60 seconds, once the turn stops or hook events go quiet.
+Pointers already in the inbox on first launch remain pending.
 
 Because Cursor `~/.cursor/hooks.json` is global across all sessions, `hook`
 only binds `conversation_id` when a conversation runs `watch` for that hook's
-exact `--agent-id` (and `--state-dir` when passed), so multiple concurrent
+exact `--agent-id` and effective state directory, so multiple concurrent
 Cursor conversations stay isolated. Non-`watch` commands (`pending`, `consume`,
 `pgrep`) never bind or hijack a session.
 
@@ -147,7 +179,8 @@ Common `watch` setup mistakes to avoid:
 - **Run `watch` inside the actual Cursor conversation** (not an external
   terminal) and pass `-u` for unbuffered stdout. Keep `--agent-id` and
   `--state-dir` identical across `notify-cmd`, `hooks.json`, `watch`, and
-  `consume`. Re-launch if a long-running background shell hits its timeout.
+  `consume`. Restart an existing watcher after upgrading the bus, or if the
+  background shell times out.
 
 Notes:
 - Registration mints `tokens/<agent>.token`; do not delete it.
@@ -157,6 +190,24 @@ Notes:
 - `agent-bus down --agent-id "$ME"` stops the notifier. Add `--daemon` if you
   started the HTTP daemon.
 - If another command fails with an auth error, check `AGENT_BUS_TOKEN_DIR`.
+
+### Multiple scopes on one machine
+
+Give each scope its own `AGENT_BUS_HOME` and pass it to both the notifier and
+every CLI call in that scope. `Bus(agent_id, home=...)` does the same for Python.
+The default database, tokens, attachments, logs, and PID files live under that
+directory. Agent IDs and group IDs can be reused across scopes. Discovery and
+delivery operate on the selected database. Keep any path overrides such as
+`AGENT_BUS_DB` and `AGENT_BUS_TOKEN_DIR` separate too.
+
+Use separate target sessions and inbox paths for each scope when reusing an
+agent ID. Pass a distinct `--state-dir` for each Cursor scope or set
+`AGENT_BUS_INBOX` for the Claude Code watcher. If several scopes use HTTP
+handoff on this machine, assign them distinct `--daemon-port` values.
+
+Filesystem access follows the operating-system user. Use separate OS accounts
+or sandboxes with separate state mounts when an agent must be unable to open
+another scope's files.
 
 ### 2. Weak model asks strong model
 
@@ -264,6 +315,7 @@ For a `group-digest-*` pointer (group wake), group-digest pointers: `agent-bus m
 The CLI is universal. The adapter determines how delivery happens:
 
 - `opencode`: session.prompt on a session id
+- `codex`: steers an active Codex turn over app server, with `codex queue --resume` for queued delivery
 - `command`: runs `AGENT_NOTIFY_CMD` template with placeholders; official generic reference path below
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
 - For tmux: busy pane rejections no longer consume retry budget; use it only as final fallback, and note the idle check is a 0.3s heuristic, not a prompt-state gate.

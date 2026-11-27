@@ -55,7 +55,9 @@ def cmd_message_show(args: argparse.Namespace) -> int:
     conn = connect()
     require_auth(conn, args.agent_id)
     row = conn.execute("SELECT * FROM messages WHERE message_id=?", (args.message_id,)).fetchone()
-    if row is None or ((args.message_id or "").startswith("group-digest-") and args.agent_id not in {row["from_agent"], row["to_agent"]}):
+    if (args.message_id or "").startswith("group-digest-") and (
+        row is None or args.agent_id not in {row["from_agent"], row["to_agent"]}
+    ):
 
         # Synthetic digest ids are shared across recipients, so a persisted
         # row can only be owned by one agent. Fall back to reconstructing the

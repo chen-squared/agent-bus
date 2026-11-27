@@ -2,16 +2,16 @@
 
 The notifier appends one pointer line to inbox.txt.
 
-- ``watch`` prints ``AGENT_LOOP_WAKE_agentbus`` to stdout for each unconsumed
-  pointer. Run it unbuffered (``python -u``) inside the target Cursor
+- ``watch`` prints ``AGENT_LOOP_WAKE_agentbus`` to stdout for a batch of due
+  pointers. Run it unbuffered (``python -u``) inside the target Cursor
   conversation with background output monitoring (``notify_on_output`` on
   ``^AGENT_LOOP_WAKE_agentbus``), and do NOT redirect stdout or detach with
   ``&``/``nohup``. A turn still receiving hook events keeps it quiet. If those
-  events stop, ``watch`` prints anyway after ``HOLD_S`` and repeats until
-  ``consume``.
+  events stop, ``watch`` retries after ``HOLD_S`` until ``consume``. The watcher
+  and hook share notice timestamps for each message ID.
 - ``hook`` runs for every Cursor session, and only the conversation that
-  started ``watch`` for that exact ``--agent-id`` (and ``--state-dir`` when
-  specified) binds and gets mail. ``postToolUse`` inserts unread pointers into
+  started ``watch`` for that exact ``--agent-id`` and effective state directory
+  binds and gets mail. ``postToolUse`` inserts new pointers into
   the turn already in progress and refreshes that heartbeat. ``stop`` and
   ``sessionEnd`` mark the conversation idle so ``watch`` can print.
 
@@ -33,8 +33,11 @@ from pathlib import Path
 
 WAKE_PREFIX = "AGENT_LOOP_WAKE_agentbus "
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,80}")
-FROM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9@_.-]{0,120}")
+# Group digest IDs combine a prefix, two 64-character IDs and a SQLite seq.
+MESSAGE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,161}")
+FROM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9@_.-]{0,128}")
 HOLD_S = 60.0
+NOTICE_LIMIT = 25
 
 _ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _PYTHON_EXE_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
@@ -44,8 +47,9 @@ _CURSOR_SUBCOMMANDS = {"watch", "hook", "consume", "pending", "notify-cmd"}
 _SHELL_NAMES = {"sh", "bash", "zsh", "dash"}
 
 
-def default_state_dir(agent_id: str) -> Path:
-    override = os.environ.get("AGENT_BUS_WAKE_HOME")
+def default_state_dir(agent_id: str, override: str | None = None) -> Path:
+    if override is None:
+        override = os.environ.get("AGENT_BUS_WAKE_HOME")
     if override:
         return Path(override).expanduser()
     return Path.home() / ".local" / "share" / "agent-bus-cursor" / agent_id
@@ -58,8 +62,8 @@ class Store:
         self.inbox = state_dir / "inbox.txt"
         self.state_path = state_dir / "wake-state.json"
         self.lock_path = state_dir / "wake.lock"
-        self.bus_cli = f"{sys.executable} -m buslib.cli"
-        self.wake_cli = f"{sys.executable} -m buslib.cursor_wake"
+        self.bus_cli = shlex.join([sys.executable, "-m", "buslib.cli"])
+        self.wake_cli = shlex.join([sys.executable, "-m", "buslib.cursor_wake"])
 
     def lock(self):
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +82,6 @@ class Store:
         out = {
             "seeded": bool(data.get("seeded")),
             "conversation_id": data.get("conversation_id") if isinstance(data.get("conversation_id"), str) else "",
-            "noticed_generation": data.get("noticed_generation") if isinstance(data.get("noticed_generation"), str) else "",
             "phase": data.get("phase") if data.get("phase") in {"running", "stopped"} else "stopped",
             "phase_at": float(data["phase_at"]) if isinstance(data.get("phase_at"), (int, float)) else 0.0,
         }
@@ -90,6 +93,11 @@ class Store:
             for key, value in raw_wake.items():
                 if isinstance(key, str) and isinstance(value, (int, float)):
                     wake_at[key] = float(value)
+        legacy_notice = data.get("noticed_generation")
+        if isinstance(legacy_notice, str):
+            for message_id in legacy_notice.rpartition("|")[2].split(","):
+                if MESSAGE_ID_RE.fullmatch(message_id):
+                    wake_at[message_id] = max(wake_at.get(message_id, 0), out["phase_at"])
         out["wake_at"] = wake_at
         return out
 
@@ -105,63 +113,44 @@ class Store:
             text = self.inbox.read_text()
         except OSError:
             return []
-        rows = []
+        rows = {}
         for line in text.splitlines():
             parts = line.split()
             if len(parts) < 3:
                 continue
-            if ID_RE.fullmatch(parts[0]) is None or ID_RE.fullmatch(parts[1]) is None or FROM_RE.fullmatch(parts[2]) is None:
+            if MESSAGE_ID_RE.fullmatch(parts[0]) is None or ID_RE.fullmatch(parts[1]) is None or FROM_RE.fullmatch(parts[2]) is None:
                 continue
-            rows.append({"id": parts[0], "thread": parts[1], "from": parts[2]})
-        return rows
+            rows.setdefault(parts[0], {"id": parts[0], "thread": parts[1], "from": parts[2]})
+        return list(rows.values())
 
     def pending(self, data: dict) -> list[dict[str, str]]:
         done = set(data["consumed"])
         return [row for row in self.pointers() if row["id"] not in done]
 
-    def seed(self) -> None:
-        handle = self.lock()
-        try:
+    def initialize(self) -> None:
+        with self.lock():
             data = self.read_state()
-            if data.get("seeded"):
-                return
-            data["consumed"] = [row["id"] for row in self.pointers()]
-            data["seeded"] = True
-            data["phase"] = "stopped"
-            self.write_state(data)
-        finally:
-            handle.close()
-
-    def prompt(self) -> str:
-        state = shlex.quote(str(self.state_dir))
-        return (
-            f"A new agent-bus message arrived for {self.agent_id}. "
-            f"Read every unconsumed pointer in {self.inbox} "
-            "(message_id thread_id from_agent). For each one run "
-            f"{self.bus_cli} message show --agent-id {self.agent_id} --message-id <id>. "
-            "If the id starts with group-digest-, read it with "
-            f"{self.bus_cli} group messages --group-id <thread_id> --agent-id {self.agent_id}. "
-            f"Do the work and reply with {self.bus_cli} send --from {self.agent_id}. "
-            f"Then run {self.wake_cli} consume --agent-id {self.agent_id} --state-dir {state} <id>. "
-            "If this id is already being handled in this session, do not start a second copy."
-        )
+            if not data["seeded"]:
+                data["seeded"] = True
+                self.write_state(data)
 
     def notice(self, rows: list[dict[str, str]]) -> str:
         state = shlex.quote(str(self.state_dir))
-        lines = [f"agent-bus: unread message(s) for {self.agent_id}."]
-        for row in rows[:5]:
+        lines = [f"agent-bus has unread messages for {self.agent_id}."]
+        for row in rows:
             lines.append(f"- {row['id']} thread {row['thread']} from {row['from']}")
-        if len(rows) > 5:
-            lines.append(f"- {len(rows) - 5} more in {self.inbox}")
         lines.append(
-            f"Read each with {self.bus_cli} message show --agent-id {self.agent_id} --message-id <id>, "
-            f"reply with {self.bus_cli} send --from {self.agent_id}, then "
+            f"Read each with {self.bus_cli} message show --agent-id {self.agent_id} --message-id <id>. "
+            f"For a group digest, run {self.bus_cli} group messages --group-id <thread> --agent-id {self.agent_id} "
+            "and acknowledge through the served_through_seq of each page read. "
+            f"Handle each ID once, reply if needed, then run "
             f"{self.wake_cli} consume --agent-id {self.agent_id} --state-dir {state} <id>."
         )
         return "\n".join(lines)
 
     def notify_cmd(self) -> str:
-        inbox = shlex.quote(str(self.inbox))
+        # The command adapter expands format fields before handing it to bash.
+        inbox = shlex.quote(str(self.inbox)).replace("{", "{{").replace("}", "}}")
         return f"printf '%s %s %s\\n' '{{message_id}}' '{{thread_id}}' '{{from_agent}}' >> {inbox}"
 
     def log(self, text: str) -> None:
@@ -172,11 +161,15 @@ class Store:
             return
 
 
-def _emit(store: Store, row: dict[str, str]) -> None:
+def _emit(store: Store, rows: list[dict[str, str]]) -> None:
+    first = rows[0]
     sys.stdout.write(
         WAKE_PREFIX
         + json.dumps(
-            {"prompt": store.prompt(), "client": store.agent_id, "id": row["id"], "from": row["from"]},
+            {
+                "prompt": store.notice(rows), "client": store.agent_id,
+                "id": first["id"], "from": first["from"], "ids": [row["id"] for row in rows],
+            },
             ensure_ascii=False,
         )
         + "\n"
@@ -185,47 +178,38 @@ def _emit(store: Store, row: dict[str, str]) -> None:
 
 
 def drain_once(store: Store, now: float | None = None) -> list[dict[str, str]]:
-    """Print a wake line for each unconsumed pointer that is due.
+    """Print one wake line for the unconsumed pointers that are due.
 
     A turn with a recent hook event is left to ``postToolUse``. After
     ``HOLD_S`` without one, or once the turn is idle, print. Repeat until
     ``consume`` so a missed wake does not wait on a person.
     """
-    now = time.time() if now is None else float(now)
-    handle = store.lock()
-    emitted: list[dict[str, str]] = []
-    try:
+    with store.lock():
+        now = time.time() if now is None else float(now)
         data = store.read_state()
-        live = data.get("phase") == "running" and now - data["phase_at"] < HOLD_S
-        rows = []
-        if not live:
-            wake_at = data["wake_at"]
-            rows = [row for row in store.pending(data) if now - wake_at.get(row["id"], 0.0) >= HOLD_S]
-    finally:
-        handle.close()
-    for row in rows:
-        _emit(store, row)
-    if not rows:
-        return []
-    handle = store.lock()
-    try:
-        data = store.read_state()
-        for row in rows:
-            data["wake_at"][row["id"]] = now
-            emitted.append(row)
-        store.write_state(data)
-    finally:
-        handle.close()
-    return emitted
+        if data["phase"] == "running" and now - data["phase_at"] < HOLD_S:
+            return []
+        wake_at = data["wake_at"]
+        rows = [
+            row for row in store.pending(data)
+            if row["id"] not in wake_at or now - wake_at[row["id"]] >= HOLD_S
+        ][:NOTICE_LIMIT]
+        if rows:
+            _emit(store, rows)
+            wake_at.update({row["id"]: now for row in rows})
+            store.write_state(data)
+        return rows
 
 
 def watch(store: Store) -> None:
-    store.seed()
+    store.initialize()
     while True:
         try:
             drain_once(store)
-        except Exception:
-            pass
+        except BrokenPipeError:
+            return
+        except OSError as exc:
+            store.log(f"watch could not read or write state: {exc}")
         time.sleep(0.5)
 
 
@@ -535,10 +519,10 @@ def _parse_cursor_invocation(env_vars: dict[str, str], tokens: list[str]) -> tup
     return None
 
 
-def _iter_invocations(command: str, depth: int = 0):
+def _iter_invocations(command: str, depth: int = 0, inherited_env: dict[str, str] | None = None):
     if depth > 2 or not command:
         return
-    shell_env: dict[str, str] = {}
+    shell_env = dict(inherited_env or {})
     for seg in _split_shell_segments(command):
         clean = _strip_redirections(seg)
         env_vars, cmd = _unwrap_wrappers(clean)
@@ -555,17 +539,16 @@ def _iter_invocations(command: str, depth: int = 0):
         if Path(cmd[0]).name in _SHELL_NAMES:
             inner = _shell_inline_script(cmd[1:])
             if inner is not None:
-                yield from _iter_invocations(inner, depth + 1)
+                yield from _iter_invocations(inner, depth + 1, merged_env)
             continue
         parsed = _parse_cursor_invocation(merged_env, cmd)
         if parsed is not None:
             yield parsed
 
 
-def _extract_store_match(store: Store, sub_args: list[str], env_vars: dict[str, str]) -> tuple[bool, list[str]]:
+def _matches_store(store: Store, sub_args: list[str], env_vars: dict[str, str]) -> bool:
     agent_id: str | None = None
     state_dir: str | None = None
-    positionals: list[str] = []
     i = 0
     n = len(sub_args)
     while i < n:
@@ -586,50 +569,21 @@ def _extract_store_match(store: Store, sub_args: list[str], env_vars: dict[str, 
             state_dir = tok.split("=", 1)[1]
             i += 1
             continue
-        if tok == "--":
-            positionals.extend(sub_args[i + 1 :])
-            break
-        if tok.startswith("-"):
-            i += 1
-            continue
-        positionals.append(tok)
-        i += 1
+        return False
     if agent_id != store.agent_id:
-        return False, []
-    effective_state_dir = state_dir if state_dir is not None else env_vars.get("AGENT_BUS_WAKE_HOME")
-    if effective_state_dir is not None:
-        try:
-            cmd_dir = Path(effective_state_dir).expanduser().resolve(strict=False)
-            store_dir = store.state_dir.expanduser().resolve(strict=False)
-        except OSError:
-            return False, []
-        if cmd_dir != store_dir:
-            return False, []
-    return True, positionals
+        return False
+    cmd_dir = Path(state_dir).expanduser() if state_dir else default_state_dir(agent_id, env_vars.get("AGENT_BUS_WAKE_HOME"))
+    try:
+        return cmd_dir.resolve() == store.state_dir.resolve()
+    except OSError:
+        return False
 
 
 def _is_watch_command(store: Store, command: str) -> bool:
     for subcmd, sub_args, env_vars in _iter_invocations(command):
-        if subcmd != "watch":
-            continue
-        matched, _ = _extract_store_match(store, sub_args, env_vars)
-        if matched:
+        if subcmd == "watch" and _matches_store(store, sub_args, env_vars):
             return True
     return False
-
-
-def _consume_ids(store: Store, command: str) -> list[str]:
-    ids: list[str] = []
-    for subcmd, sub_args, env_vars in _iter_invocations(command):
-        if subcmd != "consume":
-            continue
-        matched, positionals = _extract_store_match(store, sub_args, env_vars)
-        if not matched:
-            continue
-        for token in positionals:
-            if ID_RE.fullmatch(token):
-                ids.append(token)
-    return ids
 
 
 def hook(store: Store, event: dict | None = None) -> dict:
@@ -645,8 +599,7 @@ def hook(store: Store, event: dict | None = None) -> dict:
     if not isinstance(conversation_id, str):
         conversation_id = ""
     out: dict = {}
-    handle = store.lock()
-    try:
+    with store.lock():
         data = store.read_state()
         command = _tool_command(event)
         changed = False
@@ -655,23 +608,19 @@ def hook(store: Store, event: dict | None = None) -> dict:
                 data["conversation_id"] = conversation_id
                 changed = True
                 store.log(f"bind conversation={conversation_id}")
-        for message_id in _consume_ids(store, command):
-            if message_id not in data["consumed"]:
-                data["consumed"].append(message_id)
-                changed = True
-        pending = store.pending(data)
         bound = bool(conversation_id) and data.get("conversation_id") == conversation_id
         if bound and name == "postToolUse":
             data["phase"] = "running"
             data["phase_at"] = time.time()
             changed = True
-            if pending:
-                generation = str(event.get("generation_id") or "")
-                signature = generation + "|" + ",".join(row["id"] for row in pending)
-                if signature != data.get("noticed_generation"):
-                    data["noticed_generation"] = signature
-                    out = {"additional_context": store.notice(pending)}
-                    store.log(f"insert {','.join(row['id'] for row in pending)}")
+            # Only a first notice can be inserted into a running turn. The
+            # watcher handles retries when the turn is idle or its events stop.
+            wake_at = data["wake_at"]
+            unseen = [row for row in store.pending(data) if row["id"] not in wake_at][:NOTICE_LIMIT]
+            if unseen:
+                wake_at.update({row["id"]: data["phase_at"] for row in unseen})
+                out = {"additional_context": store.notice(unseen)}
+                store.log(f"insert {','.join(row['id'] for row in unseen)}")
         elif bound and name in {"stop", "sessionEnd"}:
             if data.get("phase") != "stopped":
                 data["phase"] = "stopped"
@@ -681,33 +630,32 @@ def hook(store: Store, event: dict | None = None) -> dict:
                     store.log("sessionEnd idle")
         if changed:
             store.write_state(data)
-    finally:
-        handle.close()
     return out
 
 
 def hook_main(store: Store) -> None:
     try:
         sys.stdout.write(json.dumps(hook(store), ensure_ascii=False))
-    except Exception:
+    except Exception as exc:
+        store.log(f"hook could not process the event: {exc}")
         sys.stdout.write("{}")
 
 
 def consume(store: Store, ids: list[str]) -> None:
-    handle = store.lock()
-    try:
+    with store.lock():
         data = store.read_state()
         for message_id in ids:
-            if ID_RE.fullmatch(message_id) and message_id not in data["consumed"]:
+            if MESSAGE_ID_RE.fullmatch(message_id) and message_id not in data["consumed"]:
                 data["consumed"].append(message_id)
+                data["wake_at"].pop(message_id, None)
         store.write_state(data)
-    finally:
-        handle.close()
 
 
 def _store_from_args(args: argparse.Namespace) -> Store:
+    if not ID_RE.fullmatch(args.agent_id):
+        raise SystemExit("error: invalid agent id; use letters, digits, underscores, periods or hyphens")
     state_dir = Path(args.state_dir).expanduser() if args.state_dir else default_state_dir(args.agent_id)
-    return Store(args.agent_id, state_dir)
+    return Store(args.agent_id, state_dir.resolve())
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -728,17 +676,16 @@ def cmd_consume(args: argparse.Namespace) -> int:
 
 def cmd_pending(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
-    handle = store.lock()
-    try:
+    with store.lock():
         rows = store.pending(store.read_state())
-    finally:
-        handle.close()
     print(json.dumps({"ok": True, "pending": rows}))
     return 0
 
 
 def cmd_notify_cmd(args: argparse.Namespace) -> int:
-    print(_store_from_args(args).notify_cmd())
+    store = _store_from_args(args)
+    store.initialize()
+    print(store.notify_cmd())
     return 0
 
 

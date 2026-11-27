@@ -24,9 +24,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from .adapters.codex import codex_thread_id
 from .agents import cmd_register, resolve_opencode_cli
 from .config import BUS_HOME, ensure_home, home_info, json_dumps, log_dir, run_dir
-from .db import connect
+from .db import connect, db_path
 from .notifier import main as notifier_main
 from .validation import validate_id
 
@@ -119,7 +120,7 @@ def _looks_like_notifier(command: str, agent_id: str) -> bool:
     return any(
         marker in command
         for marker in ("bus_agent.py", "buslib.notifier", "agent-bus-notifier")
-    )
+    ) or bool(re.search(r"(?:^|[\s/])(?:buslib\.cli|bus\.py|agent-bus)\s+up(?:\s|$)", command))
 
 
 def _looks_like_daemon(command: str, port: int) -> bool:
@@ -220,6 +221,10 @@ def _child_env(agent_id: str | None = None) -> dict[str, str]:
     # this, a service manager starting from another cwd could silently use a
     # different source checkout / home.
     env["AGENT_BUS_HOME"] = str(BUS_HOME)
+    env["AGENT_BUS_DB"] = str(db_path())
+    for key in ("AGENT_BUS_TOKEN_DIR", "AGENT_BUS_TOKEN_FILE", "AGENT_BUS_BLOB_DIR", "AGENT_BUS_AUDIT_LOG"):
+        if value := env.get(key):
+            env[key] = str(Path(value).expanduser().resolve())
     if agent_id:
         env.setdefault("AGENT_BUS_AGENT", agent_id)
     return env
@@ -268,20 +273,19 @@ def _launch(
         "command": " ".join(argv),
         "started_at": time.time(),
     }
-    _write_pid(pid_path, record)
     # Give the process enough time to fail its token/session checks. A
     # notifier that exits immediately should make `up` fail, not print a pid.
     deadline = time.time() + 1.5
     while time.time() < deadline:
         rc = proc.poll()
         if rc is not None:
-            _remove_pid(pid_path)
             tail = _log_tail(log_path)
             raise SystemExit(
                 f"error: {info.get('kind', 'process')} exited immediately (rc={rc})"
                 + (f"\n--- {log_path} ---\n{tail}" if tail else "")
             )
         time.sleep(0.1)
+    _write_pid(pid_path, record)
     return record
 
 
@@ -321,6 +325,8 @@ def _notifier_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--notify-cmd", args.notify_cmd]
     if args.cli:
         argv += ["--cli", args.cli]
+    if args.codex_remote:
+        argv += ["--codex-remote", args.codex_remote]
     if args.cwd:
         argv += ["--cwd", args.cwd]
     if args.poll is not None:
@@ -455,12 +461,12 @@ def cmd_up(args: argparse.Namespace) -> int:
         raise SystemExit("error: --agent-id or AGENT_BUS_AGENT is required")
     ensure_home()
     validate_id("agent_id", args.agent_id)
-    adapter = args.adapter or os.environ.get("AGENT_BUS_ADAPTER") or "opencode"
-    if adapter not in {"opencode", "tmux", "command"}:
-        raise SystemExit(f"error: unknown adapter {adapter!r}; expected opencode, tmux, or command")
+    adapter = args.adapter or ("codex" if args.agent_type == "codex" else "opencode")
+    if adapter not in {"opencode", "codex", "tmux", "command"}:
+        raise SystemExit(f"error: unknown adapter {adapter!r}; expected opencode, codex, tmux, or command")
     args.adapter = adapter
     args.agent_type = args.agent_type or _infer_agent_type(adapter)
-    args.cwd = args.cwd or os.getcwd()
+    args.cwd = str(Path(args.cwd or os.getcwd()).expanduser().resolve())
     if args.foreground and args.daemon:
         raise SystemExit("error: --foreground cannot be combined with --daemon")
     for flag, value, minimum in (
@@ -474,7 +480,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     if not (1 <= int(args.daemon_port) <= 65535):
         raise SystemExit("error: --daemon-port must be in 1..65535")
 
-    if adapter == "opencode" and not args.session_id:
+    if adapter in {"opencode", "codex"} and not args.session_id:
         # A previous registration may already hold the binding. Check before
         # failing so `up` remains idempotent after a restart.
         conn = connect()
@@ -486,8 +492,10 @@ def cmd_up(args: argparse.Namespace) -> int:
             args.session_id = row["current_session_id"]
         else:
             raise SystemExit(
-                "error: --session-id is required for the opencode adapter on first registration"
+                f"error: --session-id is required for the {adapter} adapter on first registration"
             )
+    if adapter == "codex":
+        args.session_id = codex_thread_id(args.session_id)
     if adapter == "tmux" and not args.tmux_target:
         raise SystemExit("error: --tmux-target is required for the tmux adapter")
     if args.verify_session and adapter != "opencode":
@@ -519,6 +527,15 @@ def cmd_up(args: argparse.Namespace) -> int:
     env["AGENT_BUS_CWD"] = args.cwd
     existing = _find_notifier(args.agent_id)
     if existing is not None and not args.force:
+        if adapter == "codex":
+            try:
+                binding = json.loads(Path(existing["pid_file"]).read_text())
+            except (OSError, ValueError):
+                binding = None
+            if not isinstance(binding, dict) or (
+                binding.get("adapter"), binding.get("session_id"), binding.get("codex_remote")
+            ) != (adapter, args.session_id, args.codex_remote):
+                raise SystemExit("error: this agent already has a different notifier binding; use a distinct agent ID or up --force")
         daemon = _start_daemon(args, args.cwd, env) if args.daemon else None
         info = home_info()
         print(json_dumps(_up_payload(args, {
@@ -546,6 +563,7 @@ def cmd_up(args: argparse.Namespace) -> int:
             "agent_id": args.agent_id,
             "adapter": adapter,
             "session_id": args.session_id,
+            "codex_remote": args.codex_remote,
             "cwd": args.cwd,
             "pid": os.getpid(),
             "pid_file": str(_notifier_pid_path(args.agent_id)),
@@ -554,14 +572,14 @@ def cmd_up(args: argparse.Namespace) -> int:
             "started_at": time.time(),
         }
         pid_path = Path(record["pid_file"])
-        _write_pid(pid_path, record)
         old_argv = sys.argv
         try:
             sys.argv = ["agent-bus-notifier", *_notifier_argv(args)[3:]]
-            return notifier_main()
+            return notifier_main(on_start=lambda: _write_pid(pid_path, record))
         finally:
             sys.argv = old_argv
-            _remove_pid(pid_path)
+            if _read_pid(pid_path) == record["pid"]:
+                _remove_pid(pid_path)
 
     notifier = _launch(
         _notifier_argv(args),
@@ -572,6 +590,7 @@ def cmd_up(args: argparse.Namespace) -> int:
             "agent_id": args.agent_id,
             "adapter": adapter,
             "session_id": args.session_id,
+            "codex_remote": args.codex_remote,
             "cwd": args.cwd,
         },
         cwd=args.cwd,
@@ -658,6 +677,7 @@ Database: {info['db']}
 One-command start (registers the agent and starts a detached notifier):
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...>
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> --verify-session
+  agent-bus up --agent-id <id> --adapter codex --session-id <thread-uuid>
   agent-bus up --agent-id <id> --agent-type command --notify-cmd '<your hook>'
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> --daemon
 

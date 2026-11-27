@@ -9,10 +9,14 @@ delivery for idempotency, then acks.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import sqlite3
 import time
-from .adapters import Adapter, AdapterError, CommandAdapter, OpencodeAdapter, TmuxAdapter
+from collections.abc import Callable
+from contextlib import closing
+
+from .adapters import Adapter, AdapterError, CodexAdapter, CommandAdapter, OpencodeAdapter, TmuxAdapter
 from .agents import cmd_heartbeat, resolve_opencode_cli, sweep_agents
 from .config import BUS_HOME, load_token, row_to_dict, sha256_text
 from .db import connect, db_path
@@ -71,7 +75,7 @@ def record_delivery(conn: sqlite3.Connection, agent_id: str, message_id: str) ->
     )
 
 
-def main() -> int:
+def main(*, on_start: Callable[[], None] | None = None) -> int:
     os.umask(0o077)
     parser = argparse.ArgumentParser(description="agent-bus per-agent notifier", allow_abbrev=False)
     parser.add_argument("--agent-id", required=True)
@@ -85,7 +89,8 @@ def main() -> int:
         default=os.environ.get("AGENT_BUS_ALLOW_UNSAFE_TEXT") == "1",
         help="allow {text} interpolation into the shell notify template (unsafe)",
     )
-    parser.add_argument("--cli", default=os.environ.get("AGENT_BUS_CLI", DEFAULT_CLI))
+    parser.add_argument("--cli", default=os.environ.get("AGENT_BUS_CLI"))
+    parser.add_argument("--codex-remote", default=os.environ.get("AGENT_BUS_CODEX_REMOTE"))
     parser.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD", os.getcwd()), help="working directory for the adapter (default: current directory)")
     parser.add_argument("--poll", type=float, default=_env_float("AGENT_BUS_POLL", 1.0))
     parser.add_argument("--heartbeat", type=float, default=_env_float("AGENT_BUS_HEARTBEAT", 5.0))
@@ -94,24 +99,40 @@ def main() -> int:
     args = parser.parse_args()
     args.sweep = max(1.0, args.sweep)
 
+    validate_id("agent_id", args.agent_id)
+    # The delivery receipt is written after injection, so parallel pollers
+    # could both see the same pending row and inject it before either records it.
+    db = db_path()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    lock_name = f".agent-bus-notifier-{sha256_text(f'{db.name}/{args.agent_id}')}.lock"
+    with (db.parent / lock_name).open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"error: a notifier for {args.agent_id} is already running on {db}") from None
+        return _run(args, on_start)
+
+
+def _run(args: argparse.Namespace, on_start: Callable[[], None] | None) -> int:
     agent_id = args.agent_id
-    validate_id("agent_id", agent_id)
     adapter_kind = args.adapter
     session_id = args.session_id
 
-    conn = connect()
-    verify_token(conn, agent_id)
-    row = agent_row(conn, agent_id)
-    if session_id is None:
-        session_id = row["current_session_id"]
-    conn.close()
+    with closing(connect()) as conn:
+        verify_token(conn, agent_id)
+        if session_id is None:
+            session_id = agent_row(conn, agent_id)["current_session_id"]
 
     # Build adapter lazily after session known.
     adapter: Adapter
     if adapter_kind == "opencode":
         if not session_id:
             raise SystemExit("error: --session-id or registered session required for opencode adapter")
-        adapter = OpencodeAdapter(session_id, args.cli, args.cwd)
+        adapter = OpencodeAdapter(session_id, args.cli or DEFAULT_CLI, args.cwd)
+    elif adapter_kind == "codex":
+        if not session_id:
+            raise SystemExit("error: --session-id or registered thread UUID required for codex adapter")
+        adapter = CodexAdapter(session_id, args.cli, args.cwd, args.codex_remote)
     elif adapter_kind == "tmux":
         if not args.tmux_target:
             raise SystemExit("error: --tmux-target required for tmux adapter")
@@ -125,6 +146,8 @@ def main() -> int:
     else:
         raise SystemExit(f"error: unknown adapter {adapter_kind}")
 
+    if on_start is not None:
+        on_start()
     last_heartbeat = 0.0
     last_sweep = 0.0
     last_outbox = 0.0

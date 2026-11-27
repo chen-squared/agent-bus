@@ -112,6 +112,7 @@ class Bus:
         session_id: str | None = None,
         tmux_target: str | None = None,
         notify_cmd: str | None = None,
+        codex_remote: str | None = None,
         cwd: str | None = None,
         daemon: bool = False,
         daemon_port: int = 8780,
@@ -124,7 +125,7 @@ class Bus:
     ) -> dict[str, Any]:
         agent = self._require_agent()
         if adapter is None:
-            adapter = agent_type if agent_type in {"opencode", "tmux", "command"} else "opencode"
+            adapter = agent_type if agent_type in {"opencode", "codex", "tmux", "command"} else "opencode"
         argv: list[Any] = [
             "up", "--agent-id", agent, "--adapter", adapter,
             "--daemon-port", daemon_port,
@@ -137,6 +138,8 @@ class Bus:
             argv += ["--tmux-target", tmux_target]
         if notify_cmd:
             argv += ["--notify-cmd", notify_cmd]
+        if codex_remote:
+            argv += ["--codex-remote", codex_remote]
         if cwd:
             argv += ["--cwd", cwd]
         if display_name:

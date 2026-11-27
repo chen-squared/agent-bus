@@ -41,6 +41,20 @@ agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> \
   --verify-session --quiet
 ```
 
+For a Codex thread on the shared Codex app server, use its exact UUID. Inside
+the target thread, pass `"$CODEX_THREAD_ID"` as the session ID.
+
+```bash
+agent-bus up --agent-id <id> --adapter codex --session-id <thread-uuid> --quiet
+```
+
+Start the shared server with `codex app-server daemon start` to steer an
+active turn or wake an unloaded thread. For a specific app server, pass
+`--codex-remote unix:///path/to/app-server.sock`. The notifier uses
+`turn/steer` when the active turn is reachable and accepts steering. It uses
+`codex queue --resume` for idle, unloaded, or non-steerable turns. Read the
+delivered message pointer with `agent-bus message show`.
+
 For a command adapter (Claude Code or a custom hook):
 
 ```bash
@@ -70,7 +84,7 @@ the Cursor session wakes itself.
 
    `~/.cursor/hooks.json` is shared across all Cursor conversations. Each hook
    only binds `conversation_id` when that conversation launches `watch` with the
-   matching `--agent-id` (and `--state-dir` if specified). Non-`watch` commands
+   matching `--agent-id` and effective state directory. Non-`watch` commands
    (`pending`, `consume`, `pgrep`) never bind or steal another session.
 
 3. **Launch `watch` in the target Cursor conversation** (most common mistake
@@ -99,20 +113,17 @@ the Cursor session wakes itself.
      exits (e.g., 24h timeout), re-launch it in that same conversation with
      `block_until_ms: 0` and `notify_on_output`.
 
-How the two wake paths work together:
-`watch` prints `AGENT_LOOP_WAKE_agentbus ...` for each unconsumed pointer when
-the conversation is idle (`stop`/`sessionEnd`, or 60s without hook events), and
-repeats every 60 seconds until `consume`. While a turn is actively running tool
-calls, `postToolUse` keeps `watch` quiet and injects `additional_context`
-directly into that bound turn.
-
-4. **Handle and `consume` every pointer** (in addition to `agent-bus ack`):
+4. **Handle and `consume` every pointer**.
 
    ```bash
    /path/to/python -m buslib.cursor_wake consume --agent-id <id> [--state-dir <dir>] <message-id>
    ```
 
-   Skipping `consume` leaves the pointer pending so `watch` repeats every 60s.
+`watch` prints one `AGENT_LOOP_WAKE_agentbus` line per batch. While a turn is
+running, `postToolUse` introduces only new pointers through `additional_context`.
+Both paths track the same IDs. After `stop`, `sessionEnd`, or 60 seconds without
+hook events, the watcher can retry pointers that remain pending 60 seconds
+after their last notice. Restart the watcher after upgrading the bus.
 
 `up` registers the agent, starts a detached notifier, and is idempotent. It
 prints JSON on stdout; audit events go to stderr. Check the binding with:
