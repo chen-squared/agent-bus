@@ -253,7 +253,7 @@ each notifier process is restarted — verify fixes on freshly started processes
 since a running process is a frozen snapshot of the code at its start time.
 
 ```sh
-agent-bus up --agent-id <id> --adapter <opencode|codex|tmux|command> \
+agent-bus up --agent-id <id> --adapter <opencode|codex|antigravity|tmux|command> \
   --session-id <id> [--tmux-target <pane>] [--notify-cmd '<hook>']
 ```
 
@@ -261,6 +261,7 @@ Adapters:
 
 - `opencode`: uses `opencode api session.prompt` (reference implementation).
 - `codex`: steers the active turn of the thread UUID or queues a pointer via `codex queue --resume`. See [Codex wake](README.md#codex-wake) for setup.
+- `antigravity`: checks target existence/runState via `ConversationService/GetConversation` and delivers a pointer via `agentapi send-message`. See [Antigravity wake](README.md#antigravity-wake) for setup.
 - `command`: runs `AGENT_NOTIFY_CMD` / `--notify-cmd`, subject to quoting needs. Preferred generic path; let the agent monitor an inbox file or hook.
 - `tmux`: uses tmux send-keys; checks idle before injecting (final fallback only; less reliable because terminal injection can race typing).
 
@@ -269,8 +270,10 @@ Environment variables:
 - `AGENT_BUS_AGENT` default sender identity
 - `AGENT_BUS_DB` database path
 - `AGENT_BUS_ADAPTER` adapter type
-- `AGENT_BUS_SESSION` OpenCode session ID or Codex thread UUID
+- `AGENT_BUS_SESSION` OpenCode session ID, Codex thread UUID, or Antigravity conversation UUID
 - `AGENT_BUS_CODEX_REMOTE` optional Codex app-server endpoint
+- `AGENT_BUS_ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_LS_ADDRESS` Antigravity language server `host:port`
+- `ANTIGRAVITY_CSRF_TOKEN` Antigravity language server CSRF token (env only, never logged)
 - `TMUX_TARGET` tmux pane
 - `AGENT_NOTIFY_CMD` generic command template
   Placeholders: `{agent_id}`, `{session_id}`, `{from_agent}`, `{message_id}`,

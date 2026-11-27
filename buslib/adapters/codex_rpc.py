@@ -42,7 +42,7 @@ def _connect(remote: str | None, cwd: str) -> ClientConnection:
         codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
         socket_path = codex_home / "app-server-control" / "app-server-control.sock"
     path = Path(cwd) / Path(socket_path).expanduser()
-    return unix_connect(path.resolve(), open_timeout=2, close_timeout=0.5)
+    return unix_connect(str(path.resolve()), open_timeout=2, close_timeout=0.5)
 
 
 def _call(socket: ClientConnection, request_id: int, method: str, params: dict[str, Any]) -> dict[str, Any]:

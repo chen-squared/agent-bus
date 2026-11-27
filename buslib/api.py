@@ -113,6 +113,7 @@ class Bus:
         tmux_target: str | None = None,
         notify_cmd: str | None = None,
         codex_remote: str | None = None,
+        antigravity_ls_address: str | None = None,
         cwd: str | None = None,
         daemon: bool = False,
         daemon_port: int = 8780,
@@ -125,7 +126,7 @@ class Bus:
     ) -> dict[str, Any]:
         agent = self._require_agent()
         if adapter is None:
-            adapter = agent_type if agent_type in {"opencode", "codex", "tmux", "command"} else "opencode"
+            adapter = agent_type if agent_type in {"opencode", "codex", "antigravity", "tmux", "command"} else "opencode"
         argv: list[Any] = [
             "up", "--agent-id", agent, "--adapter", adapter,
             "--daemon-port", daemon_port,
@@ -140,6 +141,8 @@ class Bus:
             argv += ["--notify-cmd", notify_cmd]
         if codex_remote:
             argv += ["--codex-remote", codex_remote]
+        if antigravity_ls_address:
+            argv += ["--antigravity-ls-address", antigravity_ls_address]
         if cwd:
             argv += ["--cwd", cwd]
         if display_name:

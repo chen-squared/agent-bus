@@ -250,6 +250,35 @@ def cmd_liveness(args: argparse.Namespace) -> int:
         idle_at = probe.get("time_idle_at_ms")
         if idle_at is not None:
             out["idle_for_ms"] = max(0, int(time.time() * 1000) - int(idle_at))
+    elif row["agent_type"] == "antigravity":
+        from .adapters.antigravity import probe_antigravity_session
+        from .config import run_dir
+
+        ls_address = os.environ.get("AGENT_BUS_ANTIGRAVITY_LS_ADDRESS") or os.environ.get("ANTIGRAVITY_LS_ADDRESS")
+        if not ls_address:
+            try:
+                pid_info = json.loads((run_dir() / f"notifier-{args.agent_id}.json").read_text())
+                if isinstance(pid_info, dict) and isinstance(pid_info.get("antigravity_ls_address"), str):
+                    ls_address = pid_info["antigravity_ls_address"]
+            except (OSError, json.JSONDecodeError):
+                pass
+        probe = probe_antigravity_session(
+            row["endpoint"] or row["current_session_id"] or "",
+            ls_address=ls_address,
+        )
+        run_state = probe.get("run_state")
+        state_map = {
+            "RUN_STATE_IDLE": "idle",
+            "RUN_STATE_RUNNING": "running",
+            "RUN_STATE_CANCELLING": "cancelling",
+        }
+        out["model_liveness"] = state_map.get(run_state, "unknown") if probe.get("ok") else "unknown"
+        out["liveness_source"] = "antigravity ConversationService/GetConversation (runState, not comprehension)"
+        if probe.get("probe_error"):
+            out["probe_error"] = probe["probe_error"]
+        for k in ("run_state", "update_time", "archived"):
+            if probe.get(k) is not None:
+                out[k] = probe[k]
     else:
         out["model_liveness"] = "unknown"
         out["liveness_source"] = "none"

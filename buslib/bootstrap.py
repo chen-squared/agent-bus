@@ -24,6 +24,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from .adapters.antigravity import (
+    antigravity_conversation_id,
+    normalize_ls_address,
+    probe_antigravity_session,
+    resolve_csrf_token,
+)
 from .adapters.codex import codex_thread_id
 from .agents import cmd_register, resolve_opencode_cli
 from .config import BUS_HOME, ensure_home, home_info, json_dumps, log_dir, run_dir
@@ -327,6 +333,8 @@ def _notifier_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--cli", args.cli]
     if args.codex_remote:
         argv += ["--codex-remote", args.codex_remote]
+    if args.adapter == "antigravity" and args.antigravity_ls_address:
+        argv += ["--antigravity-ls-address", args.antigravity_ls_address]
     if args.cwd:
         argv += ["--cwd", args.cwd]
     if args.poll is not None:
@@ -461,9 +469,9 @@ def cmd_up(args: argparse.Namespace) -> int:
         raise SystemExit("error: --agent-id or AGENT_BUS_AGENT is required")
     ensure_home()
     validate_id("agent_id", args.agent_id)
-    adapter = args.adapter or ("codex" if args.agent_type == "codex" else "opencode")
-    if adapter not in {"opencode", "codex", "tmux", "command"}:
-        raise SystemExit(f"error: unknown adapter {adapter!r}; expected opencode, codex, tmux, or command")
+    adapter = args.adapter or (args.agent_type if args.agent_type in {"codex", "antigravity"} else "opencode")
+    if adapter not in {"opencode", "codex", "antigravity", "tmux", "command"}:
+        raise SystemExit(f"error: unknown adapter {adapter!r}; expected opencode, codex, antigravity, tmux, or command")
     args.adapter = adapter
     args.agent_type = args.agent_type or _infer_agent_type(adapter)
     args.cwd = str(Path(args.cwd or os.getcwd()).expanduser().resolve())
@@ -480,7 +488,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     if not (1 <= int(args.daemon_port) <= 65535):
         raise SystemExit("error: --daemon-port must be in 1..65535")
 
-    if adapter in {"opencode", "codex"} and not args.session_id:
+    if adapter in {"opencode", "codex", "antigravity"} and not args.session_id:
         # A previous registration may already hold the binding. Check before
         # failing so `up` remains idempotent after a restart.
         conn = connect()
@@ -496,10 +504,20 @@ def cmd_up(args: argparse.Namespace) -> int:
             )
     if adapter == "codex":
         args.session_id = codex_thread_id(args.session_id)
+    if adapter == "antigravity":
+        args.session_id = antigravity_conversation_id(args.session_id)
+        args.antigravity_ls_address = normalize_ls_address(args.antigravity_ls_address)
+        if not args.antigravity_ls_address:
+            raise SystemExit(
+                "error: ANTIGRAVITY_LS_ADDRESS is required for the antigravity adapter "
+                "(start from Antigravity or pass --antigravity-ls-address)"
+            )
+        if not resolve_csrf_token():
+            raise SystemExit("error: ANTIGRAVITY_CSRF_TOKEN is required for the antigravity adapter")
     if adapter == "tmux" and not args.tmux_target:
         raise SystemExit("error: --tmux-target is required for the tmux adapter")
-    if args.verify_session and adapter != "opencode":
-        raise SystemExit("error: --verify-session is only supported for the opencode adapter")
+    if args.verify_session and adapter not in {"opencode", "antigravity"}:
+        raise SystemExit("error: --verify-session is only supported for the opencode and antigravity adapters")
 
     session_probe: dict[str, Any] | None = None
     if adapter == "opencode":
@@ -522,19 +540,45 @@ def cmd_up(args: argparse.Namespace) -> int:
                 "(use --verify-session to make this fatal)",
                 file=sys.stderr,
             )
+    elif adapter == "antigravity":
+        session_probe = probe_antigravity_session(
+            args.session_id,
+            ls_address=args.antigravity_ls_address,
+            cli_path=args.cli,
+        )
+        if args.verify_session:
+            if not session_probe.get("ok"):
+                raise SystemExit(
+                    f"error: antigravity session verification failed: {session_probe.get('probe_error')}"
+                )
+        elif not session_probe.get("ok"):
+            detail = session_probe.get("probe_error") or "probe failed"
+            print(
+                f"warning: antigravity session probe for {args.session_id} is unhealthy: {detail} "
+                "(use --verify-session to make this fatal)",
+                file=sys.stderr,
+            )
 
     env = _child_env(args.agent_id)
     env["AGENT_BUS_CWD"] = args.cwd
     existing = _find_notifier(args.agent_id)
     if existing is not None and not args.force:
-        if adapter == "codex":
+        if adapter in {"codex", "antigravity"}:
             try:
                 binding = json.loads(Path(existing["pid_file"]).read_text())
             except (OSError, ValueError):
                 binding = None
-            if not isinstance(binding, dict) or (
-                binding.get("adapter"), binding.get("session_id"), binding.get("codex_remote")
-            ) != (adapter, args.session_id, args.codex_remote):
+            if adapter == "codex":
+                expected = (adapter, args.session_id, args.codex_remote)
+                actual = (
+                    binding.get("adapter"), binding.get("session_id"), binding.get("codex_remote"),
+                ) if isinstance(binding, dict) else None
+            else:
+                expected = (adapter, args.session_id, args.antigravity_ls_address)
+                actual = (
+                    binding.get("adapter"), binding.get("session_id"), binding.get("antigravity_ls_address"),
+                ) if isinstance(binding, dict) else None
+            if actual != expected:
                 raise SystemExit("error: this agent already has a different notifier binding; use a distinct agent ID or up --force")
         daemon = _start_daemon(args, args.cwd, env) if args.daemon else None
         info = home_info()
@@ -564,6 +608,7 @@ def cmd_up(args: argparse.Namespace) -> int:
             "adapter": adapter,
             "session_id": args.session_id,
             "codex_remote": args.codex_remote,
+            "antigravity_ls_address": args.antigravity_ls_address if adapter == "antigravity" else None,
             "cwd": args.cwd,
             "pid": os.getpid(),
             "pid_file": str(_notifier_pid_path(args.agent_id)),
@@ -591,6 +636,7 @@ def cmd_up(args: argparse.Namespace) -> int:
             "adapter": adapter,
             "session_id": args.session_id,
             "codex_remote": args.codex_remote,
+            "antigravity_ls_address": args.antigravity_ls_address if adapter == "antigravity" else None,
             "cwd": args.cwd,
         },
         cwd=args.cwd,
@@ -678,6 +724,7 @@ One-command start (registers the agent and starts a detached notifier):
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...>
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> --verify-session
   agent-bus up --agent-id <id> --adapter codex --session-id <thread-uuid>
+  agent-bus up --agent-id <id> --adapter antigravity --session-id <conversation-uuid>
   agent-bus up --agent-id <id> --agent-type command --notify-cmd '<your hook>'
   agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> --daemon
 

@@ -55,6 +55,23 @@ active turn or wake an unloaded thread. For a specific app server, pass
 `codex queue --resume` for idle, unloaded, or non-steerable turns. Read the
 delivered message pointer with `agent-bus message show`.
 
+For an Antigravity conversation, pass its conversation UUID
+(`"$ANTIGRAVITY_CONVERSATION_ID"` inside that conversation's shell) and start
+the notifier with access to `ANTIGRAVITY_LS_ADDRESS` and
+`ANTIGRAVITY_CSRF_TOKEN` (outside the terminal sandbox if started from inside
+Antigravity):
+
+```bash
+agent-bus up --agent-id <id> --adapter antigravity \
+  --session-id "$ANTIGRAVITY_CONVERSATION_ID" --verify-session --quiet
+```
+
+The notifier verifies the target conversation via
+`ConversationService/GetConversation` and delivers pointer prompts via
+`agentapi send-message` (waking idle conversations and injecting mid-turn into
+running ones). If Antigravity restarts and changes `ANTIGRAVITY_LS_ADDRESS` or
+`ANTIGRAVITY_CSRF_TOKEN`, restart the notifier with `agent-bus up ... --force`.
+
 For a command adapter (Claude Code or a custom hook):
 
 ```bash

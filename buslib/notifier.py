@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable
 from contextlib import closing
 
-from .adapters import Adapter, AdapterError, CodexAdapter, CommandAdapter, OpencodeAdapter, TmuxAdapter
+from .adapters import Adapter, AdapterError, AntigravityAdapter, CodexAdapter, CommandAdapter, OpencodeAdapter, TmuxAdapter
 from .agents import cmd_heartbeat, resolve_opencode_cli, sweep_agents
 from .config import BUS_HOME, load_token, row_to_dict, sha256_text
 from .db import connect, db_path
@@ -91,6 +91,7 @@ def main(*, on_start: Callable[[], None] | None = None) -> int:
     )
     parser.add_argument("--cli", default=os.environ.get("AGENT_BUS_CLI"))
     parser.add_argument("--codex-remote", default=os.environ.get("AGENT_BUS_CODEX_REMOTE"))
+    parser.add_argument("--antigravity-ls-address", default=None)
     parser.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD", os.getcwd()), help="working directory for the adapter (default: current directory)")
     parser.add_argument("--poll", type=float, default=_env_float("AGENT_BUS_POLL", 1.0))
     parser.add_argument("--heartbeat", type=float, default=_env_float("AGENT_BUS_HEARTBEAT", 5.0))
@@ -133,6 +134,10 @@ def _run(args: argparse.Namespace, on_start: Callable[[], None] | None) -> int:
         if not session_id:
             raise SystemExit("error: --session-id or registered thread UUID required for codex adapter")
         adapter = CodexAdapter(session_id, args.cli, args.cwd, args.codex_remote)
+    elif adapter_kind == "antigravity":
+        if not session_id:
+            raise SystemExit("error: --session-id or registered conversation UUID required for antigravity adapter")
+        adapter = AntigravityAdapter(session_id, args.cli, args.cwd, args.antigravity_ls_address)
     elif adapter_kind == "tmux":
         if not args.tmux_target:
             raise SystemExit("error: --tmux-target required for tmux adapter")

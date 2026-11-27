@@ -13,6 +13,7 @@ You are one participant. Use your own `agent_id`, tier, endpoint, and token.
 - Discover endpoint:
   - OpenCode: use your session id from `opencode session list`; `OPENCODE_SESSION_ID` is the likely source.
   - Codex: use the target thread UUID. In that thread's shell it is available as `CODEX_THREAD_ID`.
+  - Antigravity: use the target conversation UUID. In that conversation's shell it is available as `ANTIGRAVITY_CONVERSATION_ID`.
   - tmux: use `tmux ls` (e.g. `1:0.0`).
   - command adapter: configure `AGENT_NOTIFY_CMD`.
 - Print your own configured identity before doing anything risky.
@@ -123,6 +124,40 @@ the CLI and desktop app use the same Codex home.
 `acked` means Codex accepted the pointer. The notifier logs successful steer
 deliveries and any warning from `codex queue --resume`. If resume fails after
 queueing, the pointer stays queued for when the thread resumes.
+
+### Antigravity wake
+
+Antigravity conversations expose `agentapi send-message` (and
+`ConversationService/GetConversation` on `ANTIGRAVITY_LS_ADDRESS`), which wakes
+idle conversations and injects mid-turn into running ones. Start the notifier
+with access to the local Antigravity language server (outside the terminal
+sandbox when launched from inside Antigravity, or from an external terminal
+with `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` exported):
+
+```bash
+agent-bus up --agent-id dev-agy --adapter antigravity \
+  --session-id "$ANTIGRAVITY_CONVERSATION_ID" --verify-session --quiet
+```
+
+- `--session-id` must be the target conversation UUID (`ANTIGRAVITY_CONVERSATION_ID`).
+- `--antigravity-ls-address host:port` (or `AGENT_BUS_ANTIGRAVITY_LS_ADDRESS` /
+  `ANTIGRAVITY_LS_ADDRESS`) selects the local Antigravity language server.
+- `ANTIGRAVITY_CSRF_TOKEN` must be present in the environment; it is never
+  written to CLI argv, PID files, or logs.
+- `--cli /path/to/agentapi` overrides CLI autodetection (`agentapi` on `PATH`,
+  `~/.gemini/antigravity/bin/agentapi`, or `ANTIGRAVITY_AGENTAPI_EXE`).
+- Before sending, the adapter checks target existence and `runState` via
+  `ConversationService/GetConversation` (falling back to
+  `agentapi get-conversation-metadata`) so deleted conversations fail loudly
+  instead of silently acking, and `RUN_STATE_CANCELLING` defers without burning
+  the retry budget.
+- Like Codex, delivery is pointer-first: peer text never enters `agentapi`
+  arguments. If Antigravity restarts and changes `ANTIGRAVITY_LS_ADDRESS` or
+  `ANTIGRAVITY_CSRF_TOKEN`, restart the notifier with `agent-bus up ... --force`.
+- If the target Antigravity conversation runs shell commands in Standard
+  Sandbox mode, start the notifier with a Python (>= 3.10) accessible inside
+  the workspace sandbox and keep `AGENT_BUS_HOME` inside the workspace or `/tmp`
+  so message reads and replies run without sandbox approval prompts.
 
 ### Other agents
 
@@ -316,6 +351,7 @@ The CLI is universal. The adapter determines how delivery happens:
 
 - `opencode`: session.prompt on a session id
 - `codex`: steers an active Codex turn over app server, with `codex queue --resume` for queued delivery
+- `antigravity`: verifies conversation state via `ConversationService/GetConversation` and delivers pointer prompts via `agentapi send-message`
 - `command`: runs `AGENT_NOTIFY_CMD` template with placeholders; official generic reference path below
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
 - For tmux: busy pane rejections no longer consume retry budget; use it only as final fallback, and note the idle check is a 0.3s heuristic, not a prompt-state gate.
