@@ -13,7 +13,7 @@ from websockets.exceptions import WebSocketException
 from websockets.sync.client import ClientConnection, connect, unix_connect
 
 from .. import __version__
-from .base import AdapterError, DeliveryUnknownError
+from .base import AdapterError, DeliveryUnknownError, TransientAdapterError
 
 
 class _RequestRejected(RuntimeError):
@@ -23,7 +23,7 @@ class _RequestRejected(RuntimeError):
         data = error.get("data")
         self.info = data.get("codexErrorInfo") if isinstance(data, dict) else None
 
-    def can_queue(self) -> bool:
+    def can_retry_steer(self) -> bool:
         # These results confirm that Codex did not add the input to the turn.
         if self.code == -32601 or (isinstance(self.info, dict) and "activeTurnNotSteerable" in self.info):
             return True
@@ -61,7 +61,7 @@ def _call(socket: ClientConnection, request_id: int, method: str, params: dict[s
 
 
 def steer(thread_id: str, message_id: str, prompt: str, *, remote: str | None, cwd: str) -> str | None:
-    """Return the turn ID if accepted, or None when it is safe to queue."""
+    """Return the accepted turn ID, or None after verifying the thread is idle or unloaded."""
     submitted = False
     try:
         with _connect(remote, cwd) as socket:
@@ -69,14 +69,21 @@ def steer(thread_id: str, message_id: str, prompt: str, *, remote: str | None, c
             socket.send(json.dumps({"method": "initialized"}))
             history = _call(socket, 2, "thread/turns/list", {"threadId": thread_id, "limit": 1, "itemsView": "notLoaded"})
             turns = history.get("data")
-            if not isinstance(turns, list) or not turns:
-                return None
-            turn = turns[0]
-            if not isinstance(turn, dict) or turn.get("status") != "inProgress":
-                return None
+            if not isinstance(turns, list) or (turns and not isinstance(turns[0], dict)):
+                raise ValueError("invalid Codex turn list")
+            turn = turns[0] if turns else {}
+            if turn.get("status") != "inProgress":
+                result = _call(socket, 3, "thread/read", {"threadId": thread_id, "includeTurns": False})
+                thread = result.get("thread")
+                if not isinstance(thread, dict) or thread.get("id") != thread_id:
+                    raise ValueError("invalid Codex thread metadata")
+                status = thread.get("status")
+                if isinstance(status, dict) and status.get("type") in {"idle", "notLoaded"}:
+                    return None
+                raise TransientAdapterError("Codex thread is busy or its state could not be confirmed")
             turn_id = turn.get("id")
             if not isinstance(turn_id, str) or not turn_id:
-                return None
+                raise ValueError("missing active Codex turn ID")
             params = {
                 "threadId": thread_id,
                 "expectedTurnId": turn_id,
@@ -89,10 +96,15 @@ def steer(thread_id: str, message_id: str, prompt: str, *, remote: str | None, c
                 raise ValueError("Codex did not confirm the target turn ID")
             return turn_id
     except _RequestRejected as exc:
-        if submitted and not exc.can_queue():
+        if not submitted:
+            if str(exc).startswith(("thread not found:", "no rollout found for thread id")):
+                raise AdapterError(f"Codex thread not found: {exc}") from exc
+            raise TransientAdapterError(f"Codex thread status unavailable: {exc}") from exc
+        if not exc.can_retry_steer():
             raise AdapterError(f"Codex steer rejected: {exc}") from exc
+        raise TransientAdapterError(f"Codex turn did not accept steering yet: {exc}") from exc
     except (OSError, ValueError, WebSocketException) as exc:
         # After sending the request, losing the response can mean it already ran.
         if submitted:
             raise DeliveryUnknownError(f"Codex steer acknowledgement missing: {exc}") from exc
-    return None
+        raise TransientAdapterError(f"Codex app server unavailable: {exc}") from exc

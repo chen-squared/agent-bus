@@ -114,12 +114,12 @@ shell gives you that value. For a specific app server on the same host, pass
 the CLI binary. Use a distinct agent ID per thread, or `up --force` from an
 external shell to change an existing binding.
 
-The notifier sends a pointer for `agent-bus message show`. When it can reach
-the app server running the thread, it uses `turn/steer` to deliver to the
-active turn. Idle or unloaded threads use `codex queue --resume`. A turn
-that ends before steering or does not accept steering also uses the queue.
-Desktop threads using a private app server can receive queued messages when
-the CLI and desktop app use the same Codex home.
+The notifier sends a pointer for `agent-bus message show`. A running turn
+receives it through `turn/steer`. The notifier uses `codex queue --resume`
+after the app server confirms the thread is idle or unloaded. If the turn
+changes, steering is temporarily unavailable, or the desktop control
+socket is inaccessible, the message stays pending in agent-bus. A shared
+app server must own the target thread for automatic delivery.
 
 `acked` means Codex accepted the pointer. The notifier logs successful steer
 deliveries and any warning from `codex queue --resume`. If resume fails after

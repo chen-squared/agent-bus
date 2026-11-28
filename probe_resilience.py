@@ -232,17 +232,18 @@ def probe_delivery_attempts() -> None:
         db = root / "bus.db"
         attempts = root / "crash-attempts"
         release = root / "release"
+        resume_deferred = root / "resume-deferred"
         script = root / "notify.py"
         script.write_text(
             "import os, sys, time\n"
             "from pathlib import Path\n"
             "thread = os.environ['AGENT_BUS_THREAD_ID']\n"
-            "if thread in {'deferred', 'a-deferred'}:\n"
+            "root = Path(__file__).parent\n"
+            "if thread in {'deferred', 'a-deferred'} and not (root / 'resume-deferred').exists():\n"
             "    sys.exit('service unavailable')\n"
             "if thread == 'c-permanent':\n"
             "    sys.exit('conversation not found')\n"
             "if thread == 'crash':\n"
-            "    root = Path(__file__).parent\n"
             "    with (root / 'crash-attempts').open('a') as f:\n"
             "        print(os.environ['AGENT_BUS_MESSAGE_ID'], file=f)\n"
             "    deadline = time.monotonic() + 15\n"
@@ -265,7 +266,7 @@ def probe_delivery_attempts() -> None:
             return run_cli("send", "--from", "sender", "--to", "receiver", "--thread-id", thread, "--text", thread)["message_id"]
 
         def wait_for_message(message_id: str, status: str) -> tuple:
-            deadline = time.monotonic() + 6
+            deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 with closing(sqlite3.connect(db)) as conn:
                     row = conn.execute(
@@ -278,14 +279,13 @@ def probe_delivery_attempts() -> None:
 
         for agent in ("sender", "receiver"):
             run_cli("register", "--agent-id", agent, "--agent-type", "command")
-        for group in ("a-deferred", "b-healthy", "c-permanent"):
+        for group in ("a-deferred", "b-healthy"):
             run_cli("group", "create", "--from", "sender", "--group-id", group, "--topic", group)
             run_cli("group", "join", "--agent-id", "receiver", "--group-id", group)
             run_cli("group", "send", "--from", "sender", "--group-id", group, "--text", group)
         first = send("deferred")
         # More than one batch's worth of failed messages must let a fresh message through.
-        for _ in range(25):
-            send("deferred")
+        deferred = [first, *(send("deferred") for _ in range(25))]
         healthy = send("healthy")
         start = (
             "up", "--agent-id", "receiver", "--adapter", "command", "--notify-cmd",
@@ -302,8 +302,13 @@ def probe_delivery_attempts() -> None:
                 ).fetchone()
             assert state is None or state == (0,), state
 
+            # Let the batch drain before exercising the separate restart and retry-budget cases.
+            resume_deferred.touch()
+            for message_id in deferred:
+                wait_for_message(message_id, "acked")
+
             interrupted = send("crash")
-            deadline = time.monotonic() + 6
+            deadline = time.monotonic() + 15
             while not attempts.exists() or not attempts.read_text().splitlines():
                 assert time.monotonic() < deadline, "notify command never started"
                 time.sleep(0.03)
@@ -320,6 +325,9 @@ def probe_delivery_attempts() -> None:
             wait_for_message(interrupted, "acked")
             assert attempts.read_text().splitlines() == [interrupted, interrupted]
 
+            run_cli("group", "create", "--from", "sender", "--group-id", "c-permanent", "--topic", "c-permanent")
+            run_cli("group", "join", "--agent-id", "receiver", "--group-id", "c-permanent")
+            run_cli("group", "send", "--from", "sender", "--group-id", "c-permanent", "--text", "permanent failure")
             digest_id = "group-digest-c-permanent-1-receiver"
             assert wait_for_message(digest_id, "dead") == ("dead", 5, "conversation not found")
             unread = run_cli("group", "messages", "--group-id", "c-permanent", "--agent-id", "receiver")

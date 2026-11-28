@@ -43,10 +43,8 @@ class CodexAdapter:
         except ModuleNotFoundError as exc:
             if not exc.name or exc.name.split(".")[0] != "websockets":
                 raise
-            print("warning: install the agent-bus dependencies to enable Codex steer; using the Codex queue", file=sys.stderr)
-            self.steer = None
-        else:
-            self.steer = steer
+            raise SystemExit("error: install the agent-bus dependencies to enable Codex steering") from exc
+        self.steer = steer
 
         # Codex's server can have a different cwd and environment from the notifier.
         source_cli = Path(__file__).resolve().parents[2] / "bus.py"
@@ -85,11 +83,10 @@ class CodexAdapter:
                 "\nHandle this message once. Use `agent-bus answer` on its thread if it is an ask. "
                 f"If you reply, use `--idempotency-key reply-{message_id}`."
             )
-        if self.steer:
-            turn_id = self.steer(self.session_id, message_id, prompt, remote=self.remote, cwd=self.cwd)
-            if turn_id:
-                print(f"[codex {agent_id}] steered {message_id} into turn {turn_id}", flush=True)
-                return
+        turn_id = self.steer(self.session_id, message_id, prompt, remote=self.remote, cwd=self.cwd)
+        if turn_id:
+            print(f"[codex {agent_id}] steered {message_id} into turn {turn_id}", flush=True)
+            return
         args = ["queue", "--thread", self.session_id, "--resume", "--message", prompt]
         if self.remote:
             args += ["--remote", self.remote]

@@ -52,7 +52,9 @@ Start the shared server with `codex app-server daemon start` to steer an
 active turn or wake an unloaded thread. For a specific app server, pass
 `--codex-remote unix:///path/to/app-server.sock`. The notifier uses
 `turn/steer` when the active turn is reachable and accepts steering. It uses
-`codex queue --resume` for idle, unloaded, or non-steerable turns. Read the
+`codex queue --resume` after the app server confirms idle or unloaded status.
+When control is unavailable or an active turn cannot be steered, the bus keeps
+the message pending. Read the
 delivered message pointer with `agent-bus message show`.
 
 For an Antigravity conversation, pass its conversation UUID

@@ -10,12 +10,15 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from buslib.adapters.base import AdapterError
+from websockets.sync.server import unix_serve
+
+from buslib.adapters.base import AdapterError, DeliveryUnknownError, TransientAdapterError
 from buslib.adapters.codex import CodexAdapter
 
 HERE = Path(__file__).resolve().parent
@@ -39,13 +42,13 @@ print('Warning: message was queued, but could not resume thread (probe)', file=s
 
 
 class Server:
-    def __init__(self, turn, steer_response=None):
+    def __init__(self, turn, response=None):
         self.requests = []
         self.replies = iter([
             {"id": 1, "result": {}},
             {"id": 2, "method": "thread/status/changed", "params": {}},
-            {"id": 2, "result": {"data": [turn]}},
-            steer_response,
+            {"id": 2, "result": {"data": [turn] if turn else []}},
+            response,
         ])
 
     def __enter__(self):
@@ -74,32 +77,40 @@ def probe_steer() -> None:
         "code": -32600, "message": "cannot steer a review turn",
         "data": {"codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "review"}}},
     }}
+    idle = {"id": "old", "status": "completed"}
+    def thread_state(state):
+        return {"id": 3, "result": {"thread": {"id": THREAD, "status": {"type": state}}}}
+
+    missing_thread = {"id": 3, "error": {"code": -32602, "message": f"thread not found: {THREAD}"}}
     message = {"to_agent": "receiver", "message_id": "probe-steer", "payload": PRIVATE_TEXT}
     cli_ok = subprocess.CompletedProcess([], 0, "codex queue --resume", "")
     turns = [
-        (Server(active, result), False, False),
-        (Server({"id": "old", "status": "completed"}), True, False),
-        (Server(active, no_active), True, False),
-        (Server(active, changed), True, False),
-        (Server(active, review), True, False),
-        (Server(active), False, True),
+        (Server(active, result), False, None),
+        (Server(idle, thread_state("idle")), True, None),
+        (Server(None, thread_state("notLoaded")), True, None),
+        (Server(idle, thread_state("active")), False, TransientAdapterError),
+        (Server(idle, missing_thread), False, AdapterError),
+        (Server(active, no_active), False, TransientAdapterError),
+        (Server(active, changed), False, TransientAdapterError),
+        (Server(active, review), False, TransientAdapterError),
+        (Server(active), False, DeliveryUnknownError),
     ]
     with patch.object(CodexAdapter, "_run", return_value=cli_ok) as cli:
         adapter = CodexAdapter(THREAD, sys.executable, str(HERE), REMOTE)
-        for server, queued, missing_ack in turns:
+        for server, queued, failure in turns:
             cli.reset_mock()
             with patch("buslib.adapters.codex_rpc._connect", return_value=server):
                 try:
                     adapter.inject(message)
                 except AdapterError as exc:
-                    assert missing_ack and "acknowledgement missing" in str(exc), exc
+                    assert type(exc) is failure, exc
                 else:
-                    assert not missing_ack
+                    assert failure is None
             assert cli.call_count == int(queued), (server.requests, cli.call_args_list)
             assert [request["method"] for request in server.requests[:3]] == [
                 "initialize", "initialized", "thread/turns/list",
             ]
-            if len(server.requests) > 3:
+            if server.requests[3]["method"] == "turn/steer":
                 steer = server.requests[3]
                 assert steer["method"] == "turn/steer"
                 params = steer["params"]
@@ -108,12 +119,27 @@ def probe_steer() -> None:
                 assert message["message_id"] in prompt and PRIVATE_TEXT not in prompt, prompt
 
 
+def idle_app_server(socket) -> None:
+    responses = {
+        "initialize": {},
+        "thread/turns/list": {"data": []},
+        "thread/read": {"thread": {"id": THREAD, "status": {"type": "idle"}}},
+    }
+    for raw in socket:
+        request = json.loads(raw)
+        if "id" in request:
+            response = responses[request["method"]]
+            socket.send(json.dumps({"id": request["id"], "result": response}))
+
+
 def run(root: Path) -> None:
     bus_home = root / "bus home"
     target_cwd = root / "target project"
     target_cwd.mkdir()
     relative_db = Path("custom bus db") / "messages.sqlite"
     calls_path = root / "calls.jsonl"
+    socket_path = root / "app-server.sock"
+    remote = f"unix://{socket_path}"
     fake_cli = root / "fake codex"
     fake_cli.write_text(f"#!{sys.executable}\n" + STUB)
     fake_cli.chmod(0o700)
@@ -135,7 +161,7 @@ def run(root: Path) -> None:
     run_cli("register", "--agent-id", "sender", "--agent-type", "command")
     start = [
         "up", "--agent-id", "receiver", "--agent-type", "codex", "--session-id", THREAD,
-        "--cli", str(fake_cli), "--codex-remote", REMOTE, "--cwd", target_cwd.name, "--poll", "0.05", "--outbox-flush", "0",
+        "--cli", str(fake_cli), "--codex-remote", remote, "--cwd", target_cwd.name, "--poll", "0.05", "--outbox-flush", "0",
     ]
     try:
         result = json.loads(run_cli(*start).stdout)
@@ -155,21 +181,34 @@ def run(root: Path) -> None:
         first = json.loads(run_cli(*args).stdout)["message_id"]
         again = json.loads(run_cli(*args).stdout)["message_id"]
         assert first == again
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            with closing(sqlite3.connect(root / relative_db)) as conn:
-                status = conn.execute("SELECT status FROM messages WHERE message_id=?", (first,)).fetchone()[0]
-            if status == "acked":
-                break
-            time.sleep(0.02)
-        else:
+        def wait_for_message(predicate):
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                with closing(sqlite3.connect(root / relative_db)) as conn:
+                    row = conn.execute("SELECT status,retry_count,last_error FROM messages WHERE message_id=?", (first,)).fetchone()
+                if predicate(row):
+                    return row
+                time.sleep(0.02)
             raise AssertionError(notifier_log.read_text())
+
+        # No reachable server means the bus keeps the input pending without queueing it in Codex.
+        row = wait_for_message(lambda row: "Codex app server unavailable" in (row[2] or ""))
+        assert row[:2] == ("queued", 0) and not calls_path.exists(), row
+
+        with unix_serve(idle_app_server, str(socket_path)) as server:
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                wait_for_message(lambda row: row[0] == "acked")
+            finally:
+                server.shutdown()
+                worker.join(timeout=3)
 
         calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
         assert len(calls) == 1, calls
         args = calls[0]
         assert args[:5] == ["queue", "--thread", THREAD, "--resume", "--message"], args
-        assert args[6:] == ["--remote", REMOTE], args
+        assert args[6:] == ["--remote", remote], args
         prompt = args[5]
         assert first in prompt and PRIVATE_TEXT not in prompt, prompt
         read_command = shlex.split(prompt.splitlines()[1])
@@ -182,6 +221,6 @@ def run(root: Path) -> None:
 
 if __name__ == "__main__":
     probe_steer()
-    with tempfile.TemporaryDirectory(prefix="bus-codex-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bus-codex-", dir="/tmp") as tmp:
         run(Path(tmp))
     print("CODEX_WAKE_OK")
