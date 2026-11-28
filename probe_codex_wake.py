@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shlex
@@ -20,6 +21,7 @@ from websockets.sync.server import unix_serve
 
 from buslib.adapters.base import AdapterError, DeliveryUnknownError, TransientAdapterError
 from buslib.adapters.codex import CodexAdapter
+from buslib.codex_desktop import cmd_codex_desktop
 
 HERE = Path(__file__).resolve().parent
 THREAD = "d943d26f-c0ac-40a7-af9a-75b59338a3c7"
@@ -109,6 +111,50 @@ def probe_delivery() -> None:
             prompt = params["input"][0]["text"]
             assert message["message_id"] in prompt and PRIVATE_TEXT not in prompt, prompt
     assert len(client_message_ids) == 1, client_message_ids
+
+
+def probe_desktop(root: Path) -> None:
+    thread_read = ("thread/read", {"result": thread_state("notLoaded")})
+    not_found = ("thread/read", {"error": {"code": -32602, "message": f"thread not found: {THREAD}"}})
+    codex_home = root / "codex"
+    socket_path = codex_home / "app-server-control/app-server-control.sock"
+    check = ["/usr/bin/osascript", "-e", 'application id "com.openai.codex" is running']
+    start = ["/opt/codex", "app-server", "daemon", "start"]
+    launch = [
+        "/usr/bin/open", "-b", "com.openai.codex",
+        "--env", f"CODEX_APP_SERVER_WS_URL=ws+unix://localhost{socket_path}:/rpc",
+        "--env", f"CODEX_HOME={codex_home}", "-u", f"codex://threads/{THREAD}",
+    ]
+    cases = [
+        (["false", "", "false", ""], [check, start, check, launch], thread_read, None),
+        (["true"], [check], thread_read, "is already running"),
+        (["false", "", "true"], [check, start, check], thread_read, "is already running"),
+        (["false", ""], [check, start], not_found, "Check the UUID and CODEX_HOME"),
+    ]
+    args = argparse.Namespace(session_id=None, cli=None)
+    env = {"CODEX_HOME": str(codex_home), "CODEX_THREAD_ID": THREAD}
+    for results, commands, reply, error in cases:
+        server = Server([reply])
+        with (
+            patch("buslib.codex_desktop.sys.platform", "darwin"),
+            patch.dict(os.environ, env),
+            patch("buslib.codex_desktop.shutil.which", return_value="/opt/codex"),
+            patch("buslib.codex_desktop._run", side_effect=results) as run,
+            patch("buslib.adapters.codex_rpc._connect", side_effect=[ConnectionRefusedError(), server]) as connect,
+        ):
+            try:
+                assert cmd_codex_desktop(args) == 0
+            except SystemExit as exc:
+                assert error is not None and error in str(exc), exc
+            else:
+                assert error is None
+        assert [call.args[0] for call in run.call_args_list] == commands
+        if start in commands:
+            assert connect.call_count == 2
+            assert [request["method"] for request in server.requests] == ["initialize", "initialized", "thread/read"]
+            assert server.requests[-1]["params"] == {"threadId": THREAD, "includeTurns": False}
+        else:
+            connect.assert_not_called()
 
 
 def run(root: Path) -> None:
@@ -208,5 +254,7 @@ def run(root: Path) -> None:
 if __name__ == "__main__":
     probe_delivery()
     with tempfile.TemporaryDirectory(prefix="bus-codex-", dir="/tmp") as tmp:
-        run(Path(tmp))
+        root = Path(tmp)
+        probe_desktop(root)
+        run(root)
     print("CODEX_WAKE_OK")

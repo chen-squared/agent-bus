@@ -34,15 +34,17 @@ class _RequestRejected(RuntimeError):
         )
 
 
+def default_socket_path() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    return codex_home / "app-server-control" / "app-server-control.sock"
+
+
 def _connect(remote: str | None, cwd: str) -> ClientConnection:
     if remote and not remote.startswith("unix://"):
         return connect(remote, open_timeout=3, close_timeout=0.5)
 
     socket_path = remote.removeprefix("unix://") if remote else ""
-    if not socket_path:
-        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
-        socket_path = codex_home / "app-server-control" / "app-server-control.sock"
-    path = Path(cwd) / Path(socket_path).expanduser()
+    path = Path(cwd) / (Path(socket_path).expanduser() if socket_path else default_socket_path())
     return unix_connect(str(path.resolve()), open_timeout=2, close_timeout=0.5)
 
 
@@ -71,14 +73,36 @@ def _thread_status(result: dict[str, Any], thread_id: str) -> str:
     return status["type"]
 
 
+def _initialize(socket: ClientConnection) -> None:
+    _call(socket, 1, "initialize", {"clientInfo": {"name": "agent-bus", "version": __version__}})
+    socket.send(json.dumps({"method": "initialized"}))
+
+
+def wait_for_thread(thread_id: str, socket_path: Path) -> None:
+    """Wait for the local App Server to serve metadata for an existing thread."""
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            with _connect(f"unix://{socket_path}", str(socket_path.parent)) as socket:
+                _initialize(socket)
+                read = _call(socket, 2, "thread/read", {"threadId": thread_id, "includeTurns": False})
+                _thread_status(read, thread_id)
+            return
+        except _RequestRejected as exc:
+            raise AdapterError(f"App Server could not read thread {thread_id}: {exc}. Check the UUID and CODEX_HOME.") from exc
+        except (OSError, ValueError, WebSocketException) as exc:
+            if time.monotonic() >= deadline:
+                raise AdapterError(f"Codex App Server did not become ready at {socket_path}: {exc}") from exc
+            time.sleep(0.2)
+
+
 def deliver(thread_id: str, message_id: str, prompt: str, *, remote: str | None, cwd: str) -> tuple[str, str]:
     """Return the method and turn ID accepted by the App Server."""
     method = None
-    request_ids = count(1)
+    request_ids = count(2)
     try:
         with _connect(remote, cwd) as socket:
-            _call(socket, next(request_ids), "initialize", {"clientInfo": {"name": "agent-bus", "version": __version__}})
-            socket.send(json.dumps({"method": "initialized"}))
+            _initialize(socket)
             target = {"threadId": thread_id}
             read = _call(socket, next(request_ids), "thread/read", {**target, "includeTurns": False})
             status = _thread_status(read, thread_id)

@@ -13,6 +13,7 @@ from .agents import (
 )
 from .blobs import cmd_blob_gc, cmd_blob_get, cmd_blob_list, cmd_blob_put
 from .bootstrap import cmd_down, cmd_guide, cmd_home, cmd_up
+from .codex_desktop import cmd_codex_desktop
 from .db import cmd_init
 from .groups import (
     cmd_group_catch_up, cmd_group_close, cmd_group_create, cmd_group_history,
@@ -116,6 +117,13 @@ def main() -> int:
     si.set_defaults(func=cmd_skill_install)
 
     add_cursor_parser(sub)
+
+    p = sub.add_parser("codex", help="Codex integration helpers")
+    codex_sub = p.add_subparsers(dest="codex_command", required=True, parser_class=BusArgumentParser)
+    desktop = codex_sub.add_parser("desktop", help="open an existing macOS Desktop chat on the shared App Server")
+    desktop.add_argument("--session-id", help="existing Codex thread UUID (default: CODEX_THREAD_ID)")
+    desktop.add_argument("--cli", help="Codex CLI path (default: the Desktop bundle, then PATH)")
+    desktop.set_defaults(func=cmd_codex_desktop)
 
     p = sub.add_parser("register", help="register or update agent")
     p.add_argument("--agent-id", required=True)

@@ -49,6 +49,7 @@ The package ships an agent-facing skill. Install it once per harness:
 
 ```bash
 agent-bus skill install          # ~/.claude/skills/agent-bus
+agent-bus skill install --dir "${CODEX_HOME:-$HOME/.codex}/skills" # Codex
 agent-bus skill path             # source and install paths
 agent-bus skill show             # print the bundled SKILL.md
 ```
@@ -100,34 +101,30 @@ agent-bus send --from "$ME" --to cat-jam --text "hello bus"
 
 The Codex chat and its notifier share one local App Server. Set `SID` to the
 target chat's UUID. A shell inside that chat exposes it as `CODEX_THREAD_ID`.
-If you are migrating a chat, pause its existing notifier with
+When migrating a chat to a different App Server, pause its existing notifier with
 `agent-bus down --agent-id dev-codex`, using its registered agent ID.
-Install agent-bus with its dependencies, then run this on the recipient's host:
+Install agent-bus with its dependencies, then connect the chat on the recipient's
+host.
 
-```bash
-codex app-server daemon start
-```
-
-Connect the chat to the shared server before starting its notifier:
-
-- **Codex CLI.** Close the original interactive session after its turn finishes,
-  then reopen the same chat with `codex resume --remote unix:// "$SID"`.
-- **ChatGPT Desktop on macOS.** Wait for active turns to finish and fully quit
-  the app with Command-Q. A regular launch can use a private App Server.
-  Launch the app on the shared socket and reopen the target chat:
+- **Codex CLI.** After the original interactive session finishes its turn, close
+  it, run `codex app-server daemon start`, then reopen the same chat with
+  `codex resume --remote unix:// "$SID"`.
+- **ChatGPT Desktop on macOS.** After active turns finish, fully quit with
+  Command-Q and run this from a terminal:
 
   ```bash
-  codex_bus_socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
-  test -S "$codex_bus_socket" &&
-    open -a /Applications/ChatGPT.app \
-      --env "CODEX_APP_SERVER_WS_URL=ws+unix://localhost${codex_bus_socket}:/rpc" \
-      -u "codex://threads/$SID"
+  agent-bus codex desktop --session-id "$SID"
   ```
 
-  Use this launch command again after fully quitting Desktop. It requires a
-  Desktop build that supports `CODEX_APP_SERVER_WS_URL`.
+  The command starts the daemon, waits for the shared App Server to recognize
+  the chat, then opens Desktop. If Desktop is already running, the command asks
+  you to quit it first. Reuse the command after a full quit. It requires a build
+  that supports the `CODEX_APP_SERVER_WS_URL` launch override. This connection
+  was verified with Desktop 26.1120.50957 and App Server 0.172.0. Desktop's
+  built-in `send_message_to_thread` was unavailable in that mode. Use
+  `--cli /path/to/codex` to select a specific CLI binary.
 
-Start the notifier from a separate terminal:
+Start the notifier once from a separate terminal:
 
 ```bash
 agent-bus up --agent-id dev-codex --adapter codex --session-id "$SID" --quiet

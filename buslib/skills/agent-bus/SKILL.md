@@ -43,25 +43,25 @@ agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> \
 
 For Codex, set `SID` to the target chat's UUID (`CODEX_THREAD_ID` in that
 chat's shell). The chat and the notifier must share the App Server. When
-migrating a chat, pause its notifier with `agent-bus down --agent-id dev-codex`
-using the registered agent ID, and wait for active turns to finish. Start the
-shared server with `codex app-server daemon start`.
+migrating a chat to a different App Server, pause its notifier with
+`agent-bus down --agent-id dev-codex` using the registered agent ID, and wait
+for active turns to finish.
 
-- CLI: close the original session and reopen it with
+- CLI: close the original session, run `codex app-server daemon start`, then run
   `codex resume --remote unix:// "$SID"`.
 - ChatGPT Desktop on macOS: fully quit the app with Command-Q, then run this
   with a build that supports `CODEX_APP_SERVER_WS_URL`. Repeat it each time you
   launch the app after a full quit.
 
   ```bash
-  codex_bus_socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
-  test -S "$codex_bus_socket" &&
-    open -a /Applications/ChatGPT.app \
-      --env "CODEX_APP_SERVER_WS_URL=ws+unix://localhost${codex_bus_socket}:/rpc" \
-      -u "codex://threads/$SID"
+  agent-bus codex desktop --session-id "$SID"
   ```
 
-Start the notifier from a separate terminal. Use a unique agent ID per chat.
+  The command starts the daemon, checks that it can read the target chat, and
+  opens Desktop. An already running Desktop is left alone. The Desktop
+  `send_message_to_thread` tool was unavailable in the tested shared mode.
+
+Start the notifier once from a separate terminal. Use a unique agent ID per chat.
 
 ```bash
 agent-bus up --agent-id dev-codex --adapter codex --session-id "$SID" --quiet
