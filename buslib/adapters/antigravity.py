@@ -17,7 +17,7 @@ from typing import Any
 
 from ..config import BUS_HOME, TOKEN_DIR
 from ..db import db_path
-from .base import AdapterError
+from .base import AdapterError, TransientAdapterError, is_transient_error
 
 _LS_ADDR_RE = re.compile(r"^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):[0-9]{1,5}$")
 _STRIP_ENV_VARS = (
@@ -354,7 +354,9 @@ class AntigravityAdapter:
         )
         if probe.get("ok"):
             if probe.get("run_state") == "RUN_STATE_CANCELLING":
-                raise AdapterError(f"Antigravity conversation {self.session_id} busy (RUN_STATE_CANCELLING)")
+                raise TransientAdapterError(
+                    f"Antigravity conversation {self.session_id} busy (RUN_STATE_CANCELLING)"
+                )
             return
         code = probe.get("code")
         if code == "not_found":
@@ -365,12 +367,20 @@ class AntigravityAdapter:
             )
         try:
             meta = self._run(["get-conversation-metadata", self.session_id], timeout=15.0)
+        except subprocess.TimeoutExpired as exc:
+            raise TransientAdapterError(f"Antigravity conversation check timed out: {exc}") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise AdapterError(f"Antigravity conversation check failed: {exc}") from exc
         err = _json_error(meta.stdout)
         if meta.returncode != 0 or err:
             detail = err or (meta.stderr or meta.stdout or probe.get("probe_error") or "conversation check failed").strip()
-            raise AdapterError(f"Antigravity conversation check failed: {detail}")
+            low = detail.lower()
+            if code == "unreachable" and "not_found" not in low and "unauthenticated" not in low:
+                raise TransientAdapterError(f"Antigravity language server unreachable: {detail}")
+            exc_obj = AdapterError(f"Antigravity conversation check failed: {detail}")
+            if is_transient_error(exc_obj):
+                raise TransientAdapterError(str(exc_obj))
+            raise exc_obj
 
     def _format_prompt(self, message: dict[str, Any]) -> str:
         message_id = message["message_id"]
@@ -433,12 +443,17 @@ class AntigravityAdapter:
         title = f"agent-bus: {message['from_agent']}"
         try:
             result = self._run(["send-message", f"--title={title}", self.session_id, prompt])
+        except subprocess.TimeoutExpired as exc:
+            raise TransientAdapterError(f"Antigravity send-message timed out: {exc}") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise AdapterError(f"Antigravity send-message failed: {exc}") from exc
         err = _json_error(result.stdout)
         if result.returncode != 0 or err:
             detail = err or (result.stderr or result.stdout or "Antigravity send-message failed").strip()
-            raise AdapterError(f"Antigravity send-message failed: {detail}")
+            exc_obj = AdapterError(f"Antigravity send-message failed: {detail}")
+            if is_transient_error(exc_obj):
+                raise TransientAdapterError(str(exc_obj))
+            raise exc_obj
 
 
 __all__ = [

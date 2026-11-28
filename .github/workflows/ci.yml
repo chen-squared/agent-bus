@@ -56,3 +56,5 @@ jobs:
         run: python3 probe_codex_wake.py
       - name: Antigravity wake probe
         run: python3 probe_antigravity_wake.py
+      - name: Resilience probe
+        run: python3 probe_resilience.py

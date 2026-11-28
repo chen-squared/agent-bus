@@ -1,7 +1,7 @@
 """Delivery adapters for the per-agent notifier."""
 
 from .antigravity import AntigravityAdapter
-from .base import Adapter, AdapterError
+from .base import Adapter, AdapterError, TransientAdapterError, is_transient_error
 from .codex import CodexAdapter
 from .command import CommandAdapter
 from .opencode import OpencodeAdapter
@@ -15,4 +15,6 @@ __all__ = [
     "CommandAdapter",
     "OpencodeAdapter",
     "TmuxAdapter",
+    "TransientAdapterError",
+    "is_transient_error",
 ]

@@ -13,7 +13,7 @@ from typing import Any
 
 from ..config import BUS_HOME, TOKEN_DIR
 from ..db import db_path
-from .base import AdapterError
+from .base import AdapterError, TransientAdapterError, is_transient_error
 
 
 def codex_thread_id(value: str) -> str:
@@ -95,10 +95,16 @@ class CodexAdapter:
             args += ["--remote", self.remote]
         try:
             result = self._run(args)
+        except subprocess.TimeoutExpired as exc:
+            raise TransientAdapterError(f"Codex queue timed out: {exc}") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise AdapterError(f"Codex queue failed: {exc}") from exc
         if result.returncode:
-            raise AdapterError((result.stderr or result.stdout or "Codex queue failed").strip())
+            detail = (result.stderr or result.stdout or "Codex queue failed").strip()
+            exc_obj = AdapterError(detail)
+            if is_transient_error(exc_obj):
+                raise TransientAdapterError(detail)
+            raise exc_obj
         for line in result.stderr.splitlines():
             if line.startswith("Warning: message was queued, but could not resume thread "):
                 # The queue accepted it. Re-enqueueing would start duplicate work.

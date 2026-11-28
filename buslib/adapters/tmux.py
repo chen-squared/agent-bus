@@ -7,7 +7,7 @@ import subprocess
 import time
 from typing import Any
 
-from .base import AdapterError
+from .base import TransientAdapterError
 
 
 class TmuxAdapter:
@@ -35,7 +35,7 @@ class TmuxAdapter:
 
     def inject(self, message: dict[str, Any]) -> None:
         if not self.is_idle():
-            raise AdapterError("target tmux pane busy")
+            raise TransientAdapterError("target tmux pane busy")
         payload = json.loads(message["payload"])
         paths = message.get("_attachment_paths") or []
         text = f"[bus:{message['message_id']} from:{message['from_agent']} thread:{message['thread_id']}] {payload.get('text','')}"

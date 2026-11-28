@@ -349,12 +349,12 @@ For a `group-digest-*` pointer (group wake), group-digest pointers: `agent-bus m
 
 The CLI is universal. The adapter determines how delivery happens:
 
-- `opencode`: session.prompt on a session id
+- `opencode`: session.prompt on a session id (dynamically re-resolves the newest versioned desktop `opencode-cli` when `--cli` is not pinned)
 - `codex`: steers an active Codex turn over app server, with `codex queue --resume` for queued delivery
 - `antigravity`: verifies conversation state via `ConversationService/GetConversation` and delivers pointer prompts via `agentapi send-message`
 - `command`: runs `AGENT_NOTIFY_CMD` template with placeholders; official generic reference path below
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
-- For tmux: busy pane rejections no longer consume retry budget; use it only as final fallback, and note the idle check is a 0.3s heuristic, not a prompt-state gate.
+- Transient target errors (busy panes, cancelling turns, connection refused / restarting local server, timeouts) defer with exponential backoff (capped at `AGENT_BUS_TRANSIENT_BACKOFF_MAX`, default 15s) without consuming the 5-retry DLQ budget; permanent errors still dead-letter after 5 attempts.
 
 Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes and pulls full text via `agent-bus message show` for 1-1 pointers, or for `group-digest-*` pointers (message show resolves them for active members, owner row or bounded reconstruction; `agent-bus group messages` remains fallback) (text never crosses a shell). The listener is unbounded (mkdir lock plus pid/heartbeat, no AGENT_BUS_WAKE_LIMIT); it is hooked on both Stop and UserPromptSubmit (timeout 3600) so coverage spans turn boundaries and the start of each turn (measured keepalive 1s, 104s, 381s, 473s; arrival-to-wake stays ~2s). Coverage is near-continuous but not continuous: while a wake is being handled there is no live listener, so messages arriving then wait for the next hook event.
 

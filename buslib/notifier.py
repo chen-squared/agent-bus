@@ -16,7 +16,16 @@ import time
 from collections.abc import Callable
 from contextlib import closing
 
-from .adapters import Adapter, AdapterError, AntigravityAdapter, CodexAdapter, CommandAdapter, OpencodeAdapter, TmuxAdapter
+from .adapters import (
+    Adapter,
+    AdapterError,
+    AntigravityAdapter,
+    CodexAdapter,
+    CommandAdapter,
+    OpencodeAdapter,
+    TmuxAdapter,
+    is_transient_error,
+)
 from .agents import cmd_heartbeat, resolve_opencode_cli, sweep_agents
 from .config import BUS_HOME, load_token, row_to_dict, sha256_text
 from .db import connect, db_path
@@ -129,7 +138,7 @@ def _run(args: argparse.Namespace, on_start: Callable[[], None] | None) -> int:
     if adapter_kind == "opencode":
         if not session_id:
             raise SystemExit("error: --session-id or registered session required for opencode adapter")
-        adapter = OpencodeAdapter(session_id, args.cli or DEFAULT_CLI, args.cwd)
+        adapter = OpencodeAdapter(session_id, args.cli, args.cwd)
     elif adapter_kind == "codex":
         if not session_id:
             raise SystemExit("error: --session-id or registered thread UUID required for codex adapter")
@@ -156,6 +165,9 @@ def _run(args: argparse.Namespace, on_start: Callable[[], None] | None) -> int:
     last_heartbeat = 0.0
     last_sweep = 0.0
     last_outbox = 0.0
+    transient_streak = 0
+    transient_backoff_until = 0.0
+    max_transient_backoff = max(args.poll, _env_float("AGENT_BUS_TRANSIENT_BACKOFF_MAX", 15.0))
     adapter_session = getattr(adapter, "session_id", getattr(adapter, "target", ""))
     explicit_session = args.session_id is not None
     log(f"started adapter={adapter_kind} session={adapter_session} home={BUS_HOME} db={db_path()}", agent_id)
@@ -168,6 +180,39 @@ def _run(args: argparse.Namespace, on_start: Callable[[], None] | None) -> int:
             cmd_ack(argparse.Namespace(agent_id=agent_id, message_id=message_id, quiet=True))
         except SystemExit as exc:
             log(f"ack failed for {message_id}: {exc}", agent_id)
+
+    def defer_transient(
+        conn: sqlite3.Connection,
+        exc: Exception,
+        label: str,
+        *,
+        message_id: str | None = None,
+        prev_error: str | None = None,
+    ) -> None:
+        nonlocal transient_streak, transient_backoff_until
+        transient_streak += 1
+        base = max(args.poll, 0.05)
+        delay = min(max_transient_backoff, base * (2 ** min(transient_streak - 1, 6)))
+        transient_backoff_until = time.monotonic() + delay
+        err_text = str(exc)[:500]
+        if message_id is not None and err_text != prev_error:
+            conn.execute(
+                "UPDATE messages SET last_error=? WHERE message_id=?",
+                (err_text, message_id),
+            )
+            conn.commit()
+        reason = "busy" if "busy" in err_text.lower() else "unavailable"
+        log(
+            f"target {reason}, deferring {label} for {delay:.2f}s; retry_count untouched: {err_text}",
+            agent_id,
+        )
+
+    def mark_recovered() -> None:
+        nonlocal transient_streak, transient_backoff_until
+        if transient_streak > 0:
+            log(f"target recovered after {transient_streak} deferred attempt(s)", agent_id)
+            transient_streak = 0
+            transient_backoff_until = 0.0
 
     while True:
         conn = None
@@ -198,67 +243,84 @@ def _run(args: argparse.Namespace, on_start: Callable[[], None] | None) -> int:
                     log(f"outbox flush: sent={sent} failed={failed}", agent_id)
                 last_outbox = time.time()
 
-            msgs = [row_to_dict(r) for r in fetch_inbox(conn, agent_id, "undelivered", 25)]
+            if time.monotonic() >= transient_backoff_until:
+                msgs = [row_to_dict(r) for r in fetch_inbox(conn, agent_id, "undelivered", 25)]
 
-            # Optional group digest (one unseen digest per poll cycle).
-            try:
-                digest_message = poll_group_digest(agent_id, conn)
-                if digest_message is not None:
-                    try:
-                        adapter.inject(digest_message)
-                        commit_group_digest(conn, agent_id, digest_message)
-                        log(f"group digest delivered for {digest_message.get('_group_id')}", agent_id)
-                    except Exception as exc:
-                        log(f"group digest failed: {exc}", agent_id)
-            except Exception as exc:
-                log(f"group digest poll error: {exc}", agent_id)
-
-            for msg in msgs:
-                if already_delivered(conn, agent_id, msg["message_id"]):
-                    # Already injected earlier; just ack.
-                    safe_ack(msg["message_id"])
-                    log(f"already delivered, re-acked {msg['message_id']}", agent_id)
-                    continue
+                # Optional group digest (one unseen digest per poll cycle).
                 try:
-                    materialize_attachments(msg, conn)
-                    adapter.inject(msg)
-                    record_delivery(conn, agent_id, msg["message_id"])
-                    conn.execute(
-                        "UPDATE messages SET status='delivered', delivered_at=COALESCE(delivered_at,?) WHERE message_id=?",
-                        (time.time(), msg["message_id"]),
-                    )
-                    conn.commit()
-                    safe_ack(msg["message_id"])
-                    log(f"delivered+acked {msg['message_id']} from {msg['from_agent']}", agent_id)
-                except AdapterError as exc:
-                    if "busy" in str(exc).lower():
-                        log(f"target busy, deferring {msg['message_id']}; retry_count untouched", agent_id)
-                    else:
-                        conn.execute(
-                            "UPDATE messages SET retry_count=retry_count+1, last_error=? WHERE message_id=?",
-                            (str(exc)[:500], msg["message_id"]),
-                        )
-                        conn.commit()
-                        row2 = conn.execute("SELECT retry_count FROM messages WHERE message_id=?", (msg["message_id"],)).fetchone()
-                        if row2 and row2["retry_count"] >= 5:
-                            conn.execute("UPDATE messages SET status='dead' WHERE message_id=?", (msg["message_id"],))
-                            conn.commit()
-                            log(f"dead-letter {msg['message_id']}: {exc}", agent_id)
-                        else:
-                            log(f"delivery failed {msg['message_id']}: {exc}", agent_id)
+                    digest_message = poll_group_digest(agent_id, conn)
+                    if digest_message is not None:
+                        try:
+                            adapter.inject(digest_message)
+                            commit_group_digest(conn, agent_id, digest_message)
+                            mark_recovered()
+                            log(f"group digest delivered for {digest_message.get('_group_id')}", agent_id)
+                        except AdapterError as exc:
+                            if is_transient_error(exc):
+                                defer_transient(conn, exc, f"group digest {digest_message.get('_group_id')}")
+                            else:
+                                log(f"group digest failed: {exc}", agent_id)
+                        except Exception as exc:
+                            log(f"group digest failed: {exc}", agent_id)
                 except Exception as exc:
-                    conn.execute(
-                        "UPDATE messages SET retry_count=retry_count+1, last_error=? WHERE message_id=?",
-                        (str(exc)[:500], msg["message_id"]),
-                    )
-                    conn.commit()
-                    row2 = conn.execute("SELECT retry_count FROM messages WHERE message_id=?", (msg["message_id"],)).fetchone()
-                    if row2 and row2["retry_count"] >= 5:
-                        conn.execute("UPDATE messages SET status='dead' WHERE message_id=?", (msg["message_id"],))
-                        conn.commit()
-                        log(f"dead-letter {msg['message_id']}: {exc}", agent_id)
-                    else:
-                        log(f"delivery failed {msg['message_id']}: {exc}", agent_id)
+                    log(f"group digest poll error: {exc}", agent_id)
+
+                if time.monotonic() >= transient_backoff_until:
+                    for msg in msgs:
+                        if already_delivered(conn, agent_id, msg["message_id"]):
+                            # Already injected earlier; just ack.
+                            safe_ack(msg["message_id"])
+                            log(f"already delivered, re-acked {msg['message_id']}", agent_id)
+                            continue
+                        try:
+                            materialize_attachments(msg, conn)
+                            adapter.inject(msg)
+                            record_delivery(conn, agent_id, msg["message_id"])
+                            conn.execute(
+                                "UPDATE messages SET status='delivered', delivered_at=COALESCE(delivered_at,?) WHERE message_id=?",
+                                (time.time(), msg["message_id"]),
+                            )
+                            conn.commit()
+                            safe_ack(msg["message_id"])
+                            mark_recovered()
+                            log(f"delivered+acked {msg['message_id']} from {msg['from_agent']}", agent_id)
+                        except AdapterError as exc:
+                            if is_transient_error(exc):
+                                defer_transient(
+                                    conn,
+                                    exc,
+                                    msg["message_id"],
+                                    message_id=msg["message_id"],
+                                    prev_error=msg.get("last_error"),
+                                )
+                                # Back off the whole batch while target is busy/restarting.
+                                break
+                            else:
+                                conn.execute(
+                                    "UPDATE messages SET retry_count=retry_count+1, last_error=? WHERE message_id=?",
+                                    (str(exc)[:500], msg["message_id"]),
+                                )
+                                conn.commit()
+                                row2 = conn.execute("SELECT retry_count FROM messages WHERE message_id=?", (msg["message_id"],)).fetchone()
+                                if row2 and row2["retry_count"] >= 5:
+                                    conn.execute("UPDATE messages SET status='dead' WHERE message_id=?", (msg["message_id"],))
+                                    conn.commit()
+                                    log(f"dead-letter {msg['message_id']}: {exc}", agent_id)
+                                else:
+                                    log(f"delivery failed {msg['message_id']}: {exc}", agent_id)
+                        except Exception as exc:
+                            conn.execute(
+                                "UPDATE messages SET retry_count=retry_count+1, last_error=? WHERE message_id=?",
+                                (str(exc)[:500], msg["message_id"]),
+                            )
+                            conn.commit()
+                            row2 = conn.execute("SELECT retry_count FROM messages WHERE message_id=?", (msg["message_id"],)).fetchone()
+                            if row2 and row2["retry_count"] >= 5:
+                                conn.execute("UPDATE messages SET status='dead' WHERE message_id=?", (msg["message_id"],))
+                                conn.commit()
+                                log(f"dead-letter {msg['message_id']}: {exc}", agent_id)
+                            else:
+                                log(f"delivery failed {msg['message_id']}: {exc}", agent_id)
         except Exception as exc:
             log(f"poll error: {exc}", agent_id)
         finally:

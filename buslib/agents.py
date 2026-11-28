@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -152,8 +153,19 @@ def cmd_agents(args: argparse.Namespace) -> int:
     return 0
 
 
+def _opencode_cli_version_key(path: Path) -> tuple[tuple[int, ...], float, str]:
+    """Sort versioned desktop CLI folders semantically so 2.10.0 beats 2.9.0."""
+    name = path.parent.name
+    nums = tuple(int(part) for part in re.findall(r"\d+", name.split("-", 1)[0]))
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (nums, mtime, name)
+
+
 def resolve_opencode_cli() -> str:
-    """Pick the opencode CLI without hardcoding a version: a pinned
+    """Pick the newest opencode CLI without hardcoding a version: a pinned
     `.../cli/2.0.29-arm64/opencode-cli` kept working silently broken the day
     the app updated to 2.0.31 and every notifier failed its next inject."""
     env = os.environ.get("AGENT_BUS_CLI")
@@ -161,8 +173,8 @@ def resolve_opencode_cli() -> str:
         return env
     base = Path.home() / "Library" / "Application Support" / "ai.opencode.desktop" / "cli"
     if base.is_dir():
-        for cand in sorted(base.glob("*/opencode-cli"), reverse=True):
-            if cand.exists() and os.access(cand, os.X_OK):
+        for cand in sorted(base.glob("*/opencode-cli"), key=_opencode_cli_version_key, reverse=True):
+            if cand.is_file() and os.access(cand, os.X_OK):
                 return str(cand)
     return "opencode"  # fall back to whatever is on PATH
 
@@ -177,9 +189,10 @@ def _opencode_outcome(session_id: str) -> dict[str, Any]:
     """
     if not session_id:
         return {"probe_error": "no session id registered"}
+    cli = resolve_opencode_cli()
     try:
         p = subprocess.run(
-            [OPENCODE_CLI, "api", "session.get", "--param", f"sessionID={session_id}"],
+            [cli, "api", "session.get", "--param", f"sessionID={session_id}"],
             capture_output=True, text=True, timeout=20,
         )
     except (OSError, subprocess.SubprocessError) as exc:
