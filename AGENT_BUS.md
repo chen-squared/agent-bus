@@ -260,7 +260,7 @@ agent-bus up --agent-id <id> --adapter <opencode|codex|antigravity|tmux|command>
 Adapters:
 
 - `opencode`: uses `opencode api session.prompt` (reference implementation).
-- `codex`: steers the active turn and queues a pointer after verifying that the thread is idle or unloaded. See [Codex wake](README.md#codex-wake) for setup.
+- `codex`: starts an idle turn or steers the active turn through the shared App Server. It resumes an unloaded thread and rechecks its state before delivery. See [Codex wake](README.md#codex-wake) for setup.
 - `antigravity`: checks target existence/runState via `ConversationService/GetConversation` and delivers a pointer via `agentapi send-message`. See [Antigravity wake](README.md#antigravity-wake) for setup.
 - `command`: runs `AGENT_NOTIFY_CMD` / `--notify-cmd`, subject to quoting needs. Preferred generic path; let the agent monitor an inbox file or hook.
 - `tmux`: uses tmux send-keys; checks idle before injecting (final fallback only; less reliable because terminal injection can race typing).

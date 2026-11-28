@@ -1,4 +1,4 @@
-"""Send a message pointer to an active Codex App Server turn."""
+"""Start or steer a Codex turn through the App Server."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import os
 import time
 import uuid
+from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -60,51 +61,75 @@ def _call(socket: ClientConnection, request_id: int, method: str, params: dict[s
     raise TimeoutError(f"timed out waiting for {method}")
 
 
-def steer(thread_id: str, message_id: str, prompt: str, *, remote: str | None, cwd: str) -> str | None:
-    """Return the accepted turn ID, or None after verifying the thread is idle or unloaded."""
-    submitted = False
+def _thread_status(result: dict[str, Any], thread_id: str) -> str:
+    thread = result.get("thread")
+    if not isinstance(thread, dict) or thread.get("id") != thread_id:
+        raise ValueError("invalid Codex thread metadata")
+    status = thread.get("status")
+    if not isinstance(status, dict) or not isinstance(status.get("type"), str):
+        raise ValueError("invalid Codex thread status")
+    return status["type"]
+
+
+def deliver(thread_id: str, message_id: str, prompt: str, *, remote: str | None, cwd: str) -> tuple[str, str]:
+    """Return the method and turn ID accepted by the App Server."""
+    method = None
+    request_ids = count(1)
     try:
         with _connect(remote, cwd) as socket:
-            _call(socket, 1, "initialize", {"clientInfo": {"name": "agent-bus", "version": __version__}})
+            _call(socket, next(request_ids), "initialize", {"clientInfo": {"name": "agent-bus", "version": __version__}})
             socket.send(json.dumps({"method": "initialized"}))
-            history = _call(socket, 2, "thread/turns/list", {"threadId": thread_id, "limit": 1, "itemsView": "notLoaded"})
-            turns = history.get("data")
-            if not isinstance(turns, list) or (turns and not isinstance(turns[0], dict)):
-                raise ValueError("invalid Codex turn list")
-            turn = turns[0] if turns else {}
-            if turn.get("status") != "inProgress":
-                result = _call(socket, 3, "thread/read", {"threadId": thread_id, "includeTurns": False})
-                thread = result.get("thread")
-                if not isinstance(thread, dict) or thread.get("id") != thread_id:
-                    raise ValueError("invalid Codex thread metadata")
-                status = thread.get("status")
-                if isinstance(status, dict) and status.get("type") in {"idle", "notLoaded"}:
-                    return None
-                raise TransientAdapterError("Codex thread is busy or its state could not be confirmed")
-            turn_id = turn.get("id")
-            if not isinstance(turn_id, str) or not turn_id:
-                raise ValueError("missing active Codex turn ID")
+            target = {"threadId": thread_id}
+            read = _call(socket, next(request_ids), "thread/read", {**target, "includeTurns": False})
+            status = _thread_status(read, thread_id)
+            if status == "notLoaded":
+                resumed = _call(socket, next(request_ids), "thread/resume", {**target, "excludeTurns": True})
+                status = _thread_status(resumed, thread_id)
+
             params = {
-                "threadId": thread_id,
-                "expectedTurnId": turn_id,
+                **target,
                 "clientUserMessageId": str(uuid.uuid5(uuid.UUID(thread_id), f"agent-bus:{message_id}")),
                 "input": [{"type": "text", "text": prompt, "text_elements": []}],
             }
-            submitted = True
-            result = _call(socket, 3, "turn/steer", params)
-            if result.get("turnId") != turn_id:
-                raise ValueError("Codex did not confirm the target turn ID")
-            return turn_id
+            if status == "active":
+                history = _call(socket, next(request_ids), "thread/turns/list", {**target, "limit": 1, "itemsView": "notLoaded"})
+                turns = history.get("data")
+                turn = turns[0] if isinstance(turns, list) and turns else None
+                if not isinstance(turn, dict) or turn.get("status") != "inProgress":
+                    raise TransientAdapterError("Codex active turn could not be confirmed")
+                turn_id = turn.get("id")
+                if not isinstance(turn_id, str) or not turn_id:
+                    raise ValueError("missing active Codex turn ID")
+                method = "turn/steer"
+                params["expectedTurnId"] = turn_id
+                result = _call(socket, next(request_ids), method, params)
+                if result.get("turnId") != turn_id:
+                    raise ValueError("Codex did not confirm the target turn ID")
+            elif status == "idle":
+                method = "turn/start"
+                result = _call(socket, next(request_ids), method, params)
+                turn = result.get("turn")
+                turn_id = turn.get("id") if isinstance(turn, dict) else None
+                if not isinstance(turn_id, str) or not turn_id:
+                    raise ValueError("Codex did not confirm the turn start")
+            else:
+                raise TransientAdapterError(f"Codex thread is unavailable ({status})")
+            return method, turn_id
     except _RequestRejected as exc:
-        if not submitted:
+        if method is None:
             if str(exc).startswith(("thread not found:", "no rollout found for thread id")):
                 raise AdapterError(f"Codex thread not found: {exc}") from exc
             raise TransientAdapterError(f"Codex thread status unavailable: {exc}") from exc
+        if method == "turn/start":
+            if exc.code == -32601:
+                raise TransientAdapterError(f"Codex app server does not support turn/start: {exc}") from exc
+            # Some App Server versions can report an error after starting the turn.
+            raise DeliveryUnknownError(f"Codex turn/start did not confirm delivery: {exc}") from exc
         if not exc.can_retry_steer():
             raise AdapterError(f"Codex steer rejected: {exc}") from exc
         raise TransientAdapterError(f"Codex turn did not accept steering yet: {exc}") from exc
     except (OSError, ValueError, WebSocketException) as exc:
         # After sending the request, losing the response can mean it already ran.
-        if submitted:
-            raise DeliveryUnknownError(f"Codex steer acknowledgement missing: {exc}") from exc
+        if method:
+            raise DeliveryUnknownError(f"Codex {method} acknowledgement missing: {exc}") from exc
         raise TransientAdapterError(f"Codex app server unavailable: {exc}") from exc

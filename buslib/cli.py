@@ -63,7 +63,7 @@ def main() -> int:
     p.add_argument("--tmux-target", default=os.environ.get("TMUX_TARGET"))
     p.add_argument("--notify-cmd", default=os.environ.get("AGENT_NOTIFY_CMD"))
     p.add_argument("--allow-unsafe-text", action="store_true", default=os.environ.get("AGENT_BUS_ALLOW_UNSAFE_TEXT") == "1")
-    p.add_argument("--cli", default=None, help="OpenCode, Codex, or Antigravity agentapi CLI path (default: autodetect)")
+    p.add_argument("--cli", default=None, help="OpenCode or Antigravity agentapi CLI path (default: autodetect)")
     p.add_argument("--codex-remote", default=os.environ.get("AGENT_BUS_CODEX_REMOTE"), help="Codex app-server endpoint on the recipient's host (default: local Codex)")
     p.add_argument("--antigravity-ls-address", default=None, help="Antigravity language server host:port (default: ANTIGRAVITY_LS_ADDRESS)")
     p.add_argument("--cwd", default=os.environ.get("AGENT_BUS_CWD"), help="adapter working directory (default: current directory)")

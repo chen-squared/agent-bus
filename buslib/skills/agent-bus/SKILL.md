@@ -41,21 +41,38 @@ agent-bus up --agent-id <id> --agent-type opencode --session-id <ses_...> \
   --verify-session --quiet
 ```
 
-For a Codex thread on the shared Codex app server, use its exact UUID. Inside
-the target thread, pass `"$CODEX_THREAD_ID"` as the session ID.
+For Codex, set `SID` to the target chat's UUID (`CODEX_THREAD_ID` in that
+chat's shell). The chat and the notifier must share the App Server. When
+migrating a chat, pause its notifier with `agent-bus down --agent-id dev-codex`
+using the registered agent ID, and wait for active turns to finish. Start the
+shared server with `codex app-server daemon start`.
+
+- CLI: close the original session and reopen it with
+  `codex resume --remote unix:// "$SID"`.
+- ChatGPT Desktop on macOS: fully quit the app with Command-Q, then run this
+  with a build that supports `CODEX_APP_SERVER_WS_URL`. Repeat it each time you
+  launch the app after a full quit.
+
+  ```bash
+  codex_bus_socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+  test -S "$codex_bus_socket" &&
+    open -a /Applications/ChatGPT.app \
+      --env "CODEX_APP_SERVER_WS_URL=ws+unix://localhost${codex_bus_socket}:/rpc" \
+      -u "codex://threads/$SID"
+  ```
+
+Start the notifier from a separate terminal. Use a unique agent ID per chat.
 
 ```bash
-agent-bus up --agent-id <id> --adapter codex --session-id <thread-uuid> --quiet
+agent-bus up --agent-id dev-codex --adapter codex --session-id "$SID" --quiet
 ```
 
-Start the shared server with `codex app-server daemon start` to steer an
-active turn or wake an unloaded thread. For a specific app server, pass
-`--codex-remote unix:///path/to/app-server.sock`. The notifier uses
-`turn/steer` when the active turn is reachable and accepts steering. It uses
-`codex queue --resume` after the app server confirms idle or unloaded status.
-When control is unavailable or an active turn cannot be steered, the bus keeps
-the message pending. Read the
-delivered message pointer with `agent-bus message show`.
+For a custom socket, pass `--codex-remote unix:///path/to/app-server.sock`.
+The notifier steers the current turn when busy and starts a new turn when idle.
+It resumes an unloaded thread before deciding which method to use. Temporary
+failures leave the message pending in agent-bus. Look for `steered … into turn …`
+or `accepted … via turn/start (…)` in the notifier log and read the delivered
+pointer with `agent-bus message show`.
 
 For an Antigravity conversation, pass its conversation UUID
 (`"$ANTIGRAVITY_CONVERSATION_ID"` inside that conversation's shell) and start

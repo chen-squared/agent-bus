@@ -98,32 +98,54 @@ agent-bus send --from "$ME" --to cat-jam --text "hello bus"
 
 ### Codex wake
 
-Install agent-bus with its dependencies and use a Codex CLI with
-`codex queue --resume`. Start the shared Codex app server to steer an active
-thread or wake an unloaded one. Start the notifier from a terminal on the
-recipient's host.
+The Codex chat and its notifier share one local App Server. Set `SID` to the
+target chat's UUID. A shell inside that chat exposes it as `CODEX_THREAD_ID`.
+If you are migrating a chat, pause its existing notifier with
+`agent-bus down --agent-id dev-codex`, using its registered agent ID.
+Install agent-bus with its dependencies, then run this on the recipient's host:
 
 ```bash
 codex app-server daemon start
+```
+
+Connect the chat to the shared server before starting its notifier:
+
+- **Codex CLI.** Close the original interactive session after its turn finishes,
+  then reopen the same chat with `codex resume --remote unix:// "$SID"`.
+- **ChatGPT Desktop on macOS.** Wait for active turns to finish and fully quit
+  the app with Command-Q. A regular launch can use a private App Server.
+  Launch the app on the shared socket and reopen the target chat:
+
+  ```bash
+  codex_bus_socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+  test -S "$codex_bus_socket" &&
+    open -a /Applications/ChatGPT.app \
+      --env "CODEX_APP_SERVER_WS_URL=ws+unix://localhost${codex_bus_socket}:/rpc" \
+      -u "codex://threads/$SID"
+  ```
+
+  Use this launch command again after fully quitting Desktop. It requires a
+  Desktop build that supports `CODEX_APP_SERVER_WS_URL`.
+
+Start the notifier from a separate terminal:
+
+```bash
 agent-bus up --agent-id dev-codex --adapter codex --session-id "$SID" --quiet
 ```
 
-Set `SID` to the target thread UUID. `CODEX_THREAD_ID` in the target thread's
-shell gives you that value. For a specific app server on the same host, pass
-`--codex-remote unix:///path/to/app-server.sock`. `--cli /path/to/codex` selects
-the CLI binary. Use a distinct agent ID per thread, or `up --force` from an
-external shell to change an existing binding.
+Use one agent ID per chat. For a custom local socket, pass
+`--codex-remote unix:///path/to/app-server.sock`. Use `up --force` from the
+separate terminal to change an existing binding.
 
-The notifier sends a pointer for `agent-bus message show`. A running turn
-receives it through `turn/steer`. The notifier uses `codex queue --resume`
-after the app server confirms the thread is idle or unloaded. If the turn
-changes, steering is temporarily unavailable, or the desktop control
-socket is inaccessible, the message stays pending in agent-bus. A shared
-app server must own the target thread for automatic delivery.
+The notifier sends a pointer for `agent-bus message show`. A busy chat receives it
+through `turn/steer` on the current turn. An idle chat starts a turn immediately
+with `turn/start`. If the thread is unloaded, the notifier resumes it and checks
+its state before delivering. Temporary failures, such as an unreachable socket
+or a changing turn, leave the message pending in agent-bus.
 
-`acked` means Codex accepted the pointer. The notifier logs successful steer
-deliveries and any warning from `codex queue --resume`. If resume fails after
-queueing, the pointer stays queued for when the thread resumes.
+`acked` means the App Server accepted the pointer. The notifier logs
+`steered … into turn …` or `accepted … via turn/start (…)` with the turn ID.
+Both routes deliver directly to the App Server without writing a Codex queue item.
 
 ### Antigravity wake
 
@@ -352,7 +374,7 @@ For a `group-digest-*` pointer (group wake), group-digest pointers: `agent-bus m
 The CLI is universal. The adapter determines how delivery happens:
 
 - `opencode`: session.prompt on a session id (dynamically re-resolves the newest versioned desktop `opencode-cli` when `--cli` is not pinned)
-- `codex`: steers an active Codex turn over app server, with `codex queue --resume` for queued delivery
+- `codex`: starts an idle turn or steers an active turn through the shared App Server
 - `antigravity`: verifies conversation state via `ConversationService/GetConversation` and delivers pointer prompts via `agentapi send-message`
 - `command`: runs `AGENT_NOTIFY_CMD` template with placeholders; official generic reference path below
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)

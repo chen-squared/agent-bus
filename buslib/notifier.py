@@ -275,7 +275,7 @@ def _build_adapter(args: argparse.Namespace, session_id: str | None) -> Adapter:
     if adapter_kind == "codex":
         if not session_id:
             raise SystemExit("error: --session-id or registered thread UUID required for codex adapter")
-        return CodexAdapter(session_id, args.cli, args.cwd, args.codex_remote)
+        return CodexAdapter(session_id, args.cwd, args.codex_remote)
     if adapter_kind == "antigravity":
         if not session_id:
             raise SystemExit("error: --session-id or registered conversation UUID required for antigravity adapter")
