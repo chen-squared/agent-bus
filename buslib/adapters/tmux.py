@@ -7,7 +7,7 @@ import subprocess
 import time
 from typing import Any
 
-from .base import TransientAdapterError
+from .base import AdapterError, DeliveryUnknownError, TransientAdapterError
 
 
 class TmuxAdapter:
@@ -34,7 +34,13 @@ class TmuxAdapter:
         return out2.returncode == 0 and out2.stdout == first
 
     def inject(self, message: dict[str, Any]) -> None:
-        if not self.is_idle():
+        try:
+            idle = self.is_idle()
+        except subprocess.TimeoutExpired as exc:
+            raise TransientAdapterError("tmux pane check timed out") from exc
+        except OSError as exc:
+            raise AdapterError(f"could not inspect tmux pane: {exc}") from exc
+        if not idle:
             raise TransientAdapterError("target tmux pane busy")
         payload = json.loads(message["payload"])
         paths = message.get("_attachment_paths") or []
@@ -45,6 +51,9 @@ class TmuxAdapter:
         # submits it: every embedded newline would execute as its own command
         # line in a shell pane. Flatten to a single line.
         text = text.replace("\r", " ").replace("\n", " ")
-        subprocess.run(["tmux", "send-keys", "-t", self.target, "-l", text], check=True, timeout=10)
-        time.sleep(0.1)
-        subprocess.run(["tmux", "send-keys", "-t", self.target, "Enter"], check=True, timeout=10)
+        try:
+            subprocess.run(["tmux", "send-keys", "-t", self.target, "-l", text], check=True, timeout=10)
+            time.sleep(0.1)
+            subprocess.run(["tmux", "send-keys", "-t", self.target, "Enter"], check=True, timeout=10)
+        except subprocess.SubprocessError as exc:
+            raise DeliveryUnknownError("tmux could not confirm that pane input was submitted") from exc

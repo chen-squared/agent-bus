@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -17,7 +18,7 @@ from typing import Any
 
 from ..config import BUS_HOME, TOKEN_DIR
 from ..db import db_path
-from .base import AdapterError, TransientAdapterError, is_transient_error
+from .base import AdapterError, DeliveryUnknownError, TransientAdapterError, is_transient_error, native_send_error
 
 _LS_ADDR_RE = re.compile(r"^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):[0-9]{1,5}$")
 _STRIP_ENV_VARS = (
@@ -47,15 +48,34 @@ def normalize_ls_address(value: str | None = None) -> str:
         addr = addr[len("http://") :]
     addr = addr.rstrip("/")
     if not _LS_ADDR_RE.fullmatch(addr):
-        raise SystemExit(
-            f"error: invalid Antigravity language server address {raw!r}; expected host:port"
-        )
-    return addr
+        raise SystemExit("error: invalid Antigravity language server address; expected loopback host:port")
+    host, port_text = addr.rsplit(":", 1)
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise SystemExit("error: invalid Antigravity language server address; port must be 1..65535")
+    if host.lower() in {"localhost", "localhost."}:
+        return f"localhost:{port}"
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        raise SystemExit("error: Antigravity language server address must be loopback") from None
+    if not ip.is_loopback:
+        raise SystemExit("error: Antigravity language server address must be loopback")
+    return f"[{ip}]:{port}" if ip.version == 6 else f"{ip}:{port}"
 
 
 def resolve_csrf_token(override: str | None = None) -> str:
     raw = override if override is not None else os.environ.get("ANTIGRAVITY_CSRF_TOKEN") or ""
     return raw.strip()
+
+
+def _redact(text: str, token: str) -> str:
+    return text.replace(token, "<redacted>") if token else text
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def resolve_antigravity_cli(cli_path: str | None = None) -> list[str] | None:
@@ -130,6 +150,7 @@ def get_conversation(
     timeout: float = 10.0,
 ) -> dict[str, Any]:
     """Read conversation state from Antigravity's ConversationService."""
+    ls_address = normalize_ls_address(ls_address)
     url = f"http://{ls_address}/product.v1.ConversationService/GetConversation"
     body = json.dumps({"conversationId": conversation_id}).encode("utf-8")
     req = urllib.request.Request(
@@ -139,15 +160,16 @@ def get_conversation(
         headers={
             "Content-Type": "application/json",
             "Connect-Protocol-Version": "1",
-            "x-antigravity-csrf-token": csrf_token,
         },
     )
-    # Bypass system/env HTTP proxies for direct local language server calls.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req.add_unredirected_header("x-antigravity-csrf-token", csrf_token)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            return {"ok": False, "code": "redirect", "probe_error": "Antigravity language server returned a redirect"}
         err_body = ""
         try:
             err_body = exc.read().decode("utf-8", errors="replace")
@@ -175,8 +197,8 @@ def get_conversation(
         return {
             "ok": False,
             "http_status": exc.code,
-            "code": code,
-            "probe_error": message[:300],
+            "code": _redact(code, csrf_token),
+            "probe_error": _redact(message, csrf_token)[:300],
             "ls_address": ls_address,
             "conversation_id": conversation_id,
         }
@@ -184,7 +206,7 @@ def get_conversation(
         return {
             "ok": False,
             "code": "unreachable",
-            "probe_error": f"{type(exc).__name__}: {exc}"[:300],
+            "probe_error": _redact(f"{type(exc).__name__}: {exc}", csrf_token)[:300],
             "ls_address": ls_address,
             "conversation_id": conversation_id,
         }
@@ -244,7 +266,7 @@ def probe_antigravity_session(
         return {"ok": False, "code": "missing_token", "probe_error": "ANTIGRAVITY_CSRF_TOKEN is not set"}
 
     probe = get_conversation(session_id, ls_address=addr, csrf_token=token, timeout=timeout)
-    if probe.get("ok") or probe.get("code") in {"not_found", "unauthenticated"}:
+    if probe.get("ok") or probe.get("code") in {"not_found", "unauthenticated", "redirect"}:
         return probe
 
     # Fall back to `agentapi get-conversation-metadata` if ConversationService
@@ -277,7 +299,7 @@ def probe_antigravity_session(
     return {
         "ok": False,
         "code": "not_found" if err and "not_found" in err.lower() else probe.get("code", "probe_failed"),
-        "probe_error": (err or res.stderr or res.stdout or probe.get("probe_error") or "probe failed").strip()[:300],
+        "probe_error": _redact((err or res.stderr or res.stdout or probe.get("probe_error") or "probe failed").strip(), token)[:300],
         "ls_address": addr,
         "conversation_id": session_id,
     }
@@ -365,6 +387,8 @@ class AntigravityAdapter:
             raise AdapterError(
                 "Antigravity authentication failed; restart the notifier with a current ANTIGRAVITY_CSRF_TOKEN"
             )
+        if code == "redirect":
+            raise AdapterError(probe["probe_error"])
         try:
             meta = self._run(["get-conversation-metadata", self.session_id], timeout=15.0)
         except subprocess.TimeoutExpired as exc:
@@ -373,7 +397,10 @@ class AntigravityAdapter:
             raise AdapterError(f"Antigravity conversation check failed: {exc}") from exc
         err = _json_error(meta.stdout)
         if meta.returncode != 0 or err:
-            detail = err or (meta.stderr or meta.stdout or probe.get("probe_error") or "conversation check failed").strip()
+            detail = _redact(
+                err or (meta.stderr or meta.stdout or probe.get("probe_error") or "conversation check failed").strip(),
+                self.csrf_token,
+            )
             low = detail.lower()
             if code == "unreachable" and "not_found" not in low and "unauthenticated" not in low:
                 raise TransientAdapterError(f"Antigravity language server unreachable: {detail}")
@@ -444,16 +471,13 @@ class AntigravityAdapter:
         try:
             result = self._run(["send-message", f"--title={title}", self.session_id, prompt])
         except subprocess.TimeoutExpired as exc:
-            raise TransientAdapterError(f"Antigravity send-message timed out: {exc}") from exc
+            raise DeliveryUnknownError("Antigravity send-message timed out waiting for acknowledgement") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise AdapterError(f"Antigravity send-message failed: {exc}") from exc
         err = _json_error(result.stdout)
         if result.returncode != 0 or err:
             detail = err or (result.stderr or result.stdout or "Antigravity send-message failed").strip()
-            exc_obj = AdapterError(f"Antigravity send-message failed: {detail}")
-            if is_transient_error(exc_obj):
-                raise TransientAdapterError(str(exc_obj))
-            raise exc_obj
+            raise native_send_error(f"Antigravity send-message failed: {_redact(detail, self.csrf_token)}")
 
 
 __all__ = [

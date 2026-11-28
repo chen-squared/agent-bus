@@ -257,7 +257,7 @@ If `group send` fails with:
   behind; wait for them to catch up.
 
 Cursors are separate: `last_read_seq` is what you claim to have read,
-`last_digest_seq` is the notifier's render watermark, and `last_served_seq`
+`last_digest_seq` is the notifier's watermark, and `last_served_seq`
 is what `group messages` actually returned. `group read` clamps to what was
 served, so prefer `group catch-up` over guessing seqs. Your own `group send`
 advances your `last_read_seq`, so back-to-back sends by you do not re-arm the

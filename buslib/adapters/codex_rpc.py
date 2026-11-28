@@ -13,7 +13,7 @@ from websockets.exceptions import WebSocketException
 from websockets.sync.client import ClientConnection, connect, unix_connect
 
 from .. import __version__
-from .base import AdapterError
+from .base import AdapterError, DeliveryUnknownError
 
 
 class _RequestRejected(RuntimeError):
@@ -94,5 +94,5 @@ def steer(thread_id: str, message_id: str, prompt: str, *, remote: str | None, c
     except (OSError, ValueError, WebSocketException) as exc:
         # After sending the request, losing the response can mean it already ran.
         if submitted:
-            raise AdapterError(f"Codex steer acknowledgement missing: {exc}") from exc
+            raise DeliveryUnknownError(f"Codex steer acknowledgement missing: {exc}") from exc
     return None

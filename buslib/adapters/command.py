@@ -7,7 +7,7 @@ import os
 import subprocess
 from typing import Any
 
-from .base import AdapterError
+from .base import AdapterError, DeliveryUnknownError
 
 
 class CommandAdapter:
@@ -48,6 +48,9 @@ class CommandAdapter:
             "AGENT_BUS_TO_AGENT": str(message["to_agent"]),
             "AGENT_BUS_TEXT": text,
         })
-        result = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=120, env=env, input=text)
+        try:
+            result = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=120, env=env, input=text)
+        except subprocess.TimeoutExpired as exc:
+            raise DeliveryUnknownError("notify command timed out waiting for acknowledgement") from exc
         if result.returncode != 0:
             raise AdapterError((result.stderr or result.stdout or "notify command failed").strip())

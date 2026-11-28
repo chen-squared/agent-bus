@@ -7,7 +7,7 @@ import subprocess
 from typing import Any
 
 from ..agents import resolve_opencode_cli
-from .base import AdapterError, TransientAdapterError, is_transient_error
+from .base import AdapterError, DeliveryUnknownError, TransientAdapterError, native_send_error
 
 
 class OpencodeAdapter:
@@ -56,21 +56,20 @@ class OpencodeAdapter:
                     try:
                         result = self._run_prompt(refreshed, body)
                     except subprocess.TimeoutExpired as timeout_exc:
-                        raise TransientAdapterError(f"opencode prompt timed out: {timeout_exc}") from timeout_exc
+                        raise DeliveryUnknownError("opencode prompt timed out waiting for acknowledgement") from timeout_exc
+                    except FileNotFoundError as retry_exc:
+                        raise TransientAdapterError("opencode CLI unavailable during autodetection") from retry_exc
                     except OSError as retry_exc:
                         raise AdapterError(f"opencode CLI unavailable at {refreshed}: {retry_exc}") from retry_exc
                 else:
-                    raise AdapterError(f"opencode CLI not found at {cli}: {exc}") from exc
+                    raise TransientAdapterError(f"opencode CLI not found at {cli}") from exc
             else:
                 raise AdapterError(f"opencode CLI not found at {cli}: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
-            raise TransientAdapterError(f"opencode prompt timed out: {exc}") from exc
+            raise DeliveryUnknownError("opencode prompt timed out waiting for acknowledgement") from exc
         except OSError as exc:
             raise AdapterError(f"opencode prompt failed to launch: {exc}") from exc
 
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "opencode prompt failed").strip()
-            err = AdapterError(detail)
-            if is_transient_error(err):
-                raise TransientAdapterError(detail)
-            raise err
+            raise native_send_error(detail)

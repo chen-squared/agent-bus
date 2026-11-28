@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from buslib.adapters.antigravity import AntigravityAdapter, normalize_ls_address
-from buslib.adapters.base import AdapterError
+from buslib.adapters.base import AdapterError, DeliveryUnknownError
 
 HERE = Path(__file__).resolve().parent
 CONVERSATION = "d943d26f-c0ac-40a7-af9a-75b59338a3c7"
@@ -31,6 +31,7 @@ STUB = """
 import json
 import os
 import sys
+from pathlib import Path
 
 args = sys.argv[1:]
 if args == ['--help']:
@@ -55,6 +56,10 @@ record = {
 }
 with open(os.environ['AGY_PROBE_CALLS'], 'a', encoding='utf-8') as log:
     log.write(json.dumps(record) + '\\n')
+drop_ack_file = Path(os.environ['AGY_PROBE_DROP_ACK_FILE'])
+if drop_ack_file.is_file() and drop_ack_file.read_text() in args[-1]:
+    print('connection reset after send', file=sys.stderr)
+    sys.exit(1)
 print(json.dumps({'response': {'sendMessage': {'recipientId': args[-2] if len(args) >= 2 else ''}}}))
 """
 
@@ -69,6 +74,10 @@ class FakeConversationServer:
             def log_message(self, format, *args):
                 return
 
+            def do_GET(self):
+                outer.requests.append({"path": self.path})
+                self._send(200, {})
+
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or "0")
                 raw = self.rfile.read(length).decode("utf-8", errors="replace")
@@ -80,6 +89,11 @@ class FakeConversationServer:
                     return
                 if token != CSRF_SECRET:
                     self._send(401, {"code": "unauthenticated", "message": "invalid CSRF token"})
+                    return
+                if outer.mode == "redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/redirected")
+                    self.end_headers()
                     return
                 if outer.mode == "unimplemented":
                     self._send(404, {"code": "unimplemented", "message": "method not implemented"})
@@ -130,12 +144,21 @@ class FakeConversationServer:
 
 def probe_adapter_unit(server: FakeConversationServer) -> None:
     assert normalize_ls_address(f"http://{server.address}/") == server.address
+    assert normalize_ls_address("LOCALHOST.:1234") == "localhost:1234"
+    assert normalize_ls_address("[::1]:1234") == "[::1]:1234"
     try:
         normalize_ls_address("https://localhost:1234/evil")
     except SystemExit as exc:
         assert "invalid Antigravity language server address" in str(exc)
     else:
         raise AssertionError("expected invalid address rejection")
+    for address in ("example.com:1234", "192.0.2.1:1234", "[2001:db8::1]:1234"):
+        try:
+            normalize_ls_address(address)
+        except SystemExit as exc:
+            assert "loopback" in str(exc), exc
+        else:
+            raise AssertionError(f"expected remote address rejection: {address}")
 
     cli_ok = subprocess.CompletedProcess([], 0, "send-message\nget-conversation-metadata", "")
     ask_msg = {
@@ -222,6 +245,27 @@ def probe_adapter_unit(server: FakeConversationServer) -> None:
                 raise AssertionError("expected authentication error")
             assert cli.call_count == 0
 
+            # Neither the HTTP client nor the agentapi fallback can follow a redirect.
+            adapter.csrf_token = CSRF_SECRET
+            server.mode = "redirect"
+            before = len(server.requests)
+            try:
+                adapter.inject(ask_msg)
+            except AdapterError as exc:
+                assert "redirect" in str(exc), exc
+            else:
+                raise AssertionError("expected redirect rejection")
+            assert cli.call_count == 0 and len(server.requests) == before + 1, server.requests[before:]
+
+            server.mode = "idle"
+            cli.side_effect = subprocess.TimeoutExpired(["agentapi", "send-message"], 30)
+            try:
+                adapter.inject(ask_msg)
+            except DeliveryUnknownError:
+                pass
+            else:
+                raise AssertionError("send-message timeout should leave an unknown outcome")
+
 
 def run(root: Path, server: FakeConversationServer) -> None:
     server.mode = "idle"
@@ -230,6 +274,7 @@ def run(root: Path, server: FakeConversationServer) -> None:
     target_cwd.mkdir()
     relative_db = Path("custom bus db") / "messages.sqlite"
     calls_path = root / "calls.jsonl"
+    drop_ack_file = root / "drop-ack"
     fake_cli = root / "fake agentapi"
     fake_cli.write_text(f"#!{sys.executable}\n" + STUB)
     fake_cli.chmod(0o700)
@@ -249,6 +294,7 @@ def run(root: Path, server: FakeConversationServer) -> None:
         "ANTIGRAVITY_TRAJECTORY_ID": "22222222-2222-2222-2222-222222222222",
         "ANTIGRAVITY_SOURCE_METADATA": '{"tool":"caller"}',
         "AGY_PROBE_CALLS": str(calls_path),
+        "AGY_PROBE_DROP_ACK_FILE": str(drop_ack_file),
         "AGY_PROBE_CSRF": CSRF_SECRET,
         "AGY_PROBE_VALID_CONV": CONVERSATION,
     }
@@ -305,6 +351,11 @@ def run(root: Path, server: FakeConversationServer) -> None:
         diff_addr = ["127.0.0.1:9" if arg == server.address else arg for arg in start if arg != "--verify-session"]
         mismatch_addr = run_cli(*diff_addr, check=False)
         assert mismatch_addr.returncode and "different notifier binding" in mismatch_addr.stderr, mismatch_addr.stderr
+
+        invalid_cli = [str(root / "invalid agentapi") if arg == str(fake_cli) else arg for arg in start]
+        replacement = run_cli(*invalid_cli, "--force", check=False)
+        assert replacement.returncode and "existing notifier kept" in replacement.stderr, replacement.stderr
+        assert pid_file.read_text() == pid_text
 
         # Duplicate notifier process is blocked by lock.
         duplicate = subprocess.run(
@@ -368,6 +419,39 @@ def run(root: Path, server: FakeConversationServer) -> None:
             raise AssertionError(notifier_log.read_text())
         digest_prompt = calls[1]["args"][3]
         assert "group-digest-agy-room-1-receiver" in digest_prompt and "group messages" in digest_prompt, digest_prompt
+
+        # A lost receipt stores the synthetic digest in the DLQ once across restarts.
+        uncertain_id = "group-digest-agy-uncertain-1-receiver"
+        drop_ack_file.write_text(uncertain_id)
+        run_cli("group", "create", "--from", "sender", "--group-id", "agy-uncertain", "--topic", "demo", "--rate-seconds", "0")
+        run_cli("group", "join", "--group-id", "agy-uncertain", "--agent-id", "receiver")
+        run_cli("group", "send", "--from", "sender", "--group-id", "agy-uncertain", "--text", "accepted before failure")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with closing(sqlite3.connect(root / relative_db)) as conn:
+                row = conn.execute(
+                    "SELECT status,retry_count,last_error FROM messages WHERE message_id=?", (uncertain_id,)
+                ).fetchone()
+            if row is not None:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(notifier_log.read_text())
+        assert row[:2] == ("dead", 0) and "delivery outcome unknown" in row[2], row
+        drop_ack_file.unlink()
+        restarted = json.loads(run_cli(*start, "--force").stdout)
+        assert restarted["notifier"]["pid"] != result["notifier"]["pid"]
+        run_cli("group", "send", "--from", "sender", "--group-id", "agy-uncertain", "--text", "new digest after failure")
+        new_id = "group-digest-agy-uncertain-2-receiver"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+            if any(new_id in c["args"][-1] for c in calls):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(notifier_log.read_text())
+        assert sum(uncertain_id in c["args"][-1] for c in calls) == 1, calls
         assert CSRF_SECRET not in notifier_log.read_text()
     finally:
         run_cli("down", "--agent-id", "receiver", "--force")

@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from .blobs import blob_materialize
+from .db import tx
 from .messaging import ensure_thread
 
 
@@ -45,6 +47,19 @@ def materialize_attachments(message: dict[str, Any], conn: sqlite3.Connection) -
     return paths
 
 
+def _advance_digest_cursor(conn: sqlite3.Connection, agent_id: str, group_id: str, seq: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO group_read_state (group_id,agent_id,last_digest_seq,updated_at)
+        VALUES (?,?,?,?)
+        ON CONFLICT(group_id,agent_id) DO UPDATE SET
+            last_digest_seq=MAX(group_read_state.last_digest_seq, excluded.last_digest_seq),
+            updated_at=excluded.updated_at
+        """,
+        (group_id, agent_id, seq, time.time()),
+    )
+
+
 def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any] | None:
     groups = conn.execute(
         """
@@ -53,22 +68,27 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
         FROM group_members gm
         JOIN groups g ON g.group_id = gm.group_id
         LEFT JOIN group_read_state grs ON grs.group_id = gm.group_id AND grs.agent_id = gm.agent_id
+        LEFT JOIN delivery_attempts a ON a.agent_id = gm.agent_id AND a.group_id = gm.group_id
         WHERE gm.agent_id = ? AND gm.status = 'active' AND g.status = 'active'
-        ORDER BY gm.group_id
+          AND (a.message_id IS NULL OR a.retry_after <= ?)
+        ORDER BY a.retry_after IS NOT NULL, a.retry_after, gm.group_id
         """,
-        (agent_id,),
+        (agent_id, time.time()),
     ).fetchall()
     for g in groups:
+        seen = max(g["last_read_seq"], g["last_digest_seq"])
         latest = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) AS seq FROM group_messages WHERE group_id=?", (g["group_id"],)
         ).fetchone()["seq"]
-        if latest <= g["last_digest_seq"]:
+        if latest <= seen:
+            if latest > g["last_digest_seq"]:
+                _advance_digest_cursor(conn, agent_id, g["group_id"], latest)
             continue
-        first = g["last_digest_seq"] + 1
+        first = seen + 1
         # Scan wider than the render budget. Own messages are skipped below, and
         # if the window were only as wide as the budget a burst of my own posts
         # would hold it open and starve everyone else's messages out of view.
-        scan_to = min(g["last_digest_seq"] + 40, latest)
+        scan_to = min(seen + 40, latest)
         rows = conn.execute(
             "SELECT seq,sender_agent,payload FROM group_messages WHERE group_id=? AND seq>=? AND seq<=? AND (expires_at IS NULL OR expires_at > ?) ORDER BY seq",
             (g["group_id"], first, scan_to, time.time()),
@@ -81,23 +101,13 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
             # window never moves past my own messages. Advancing here is safe:
             # the no-advance-before-inject invariant protects a render that could
             # fail, and there is nothing to render.
-            conn.execute(
-                """
-                INSERT INTO group_read_state (group_id,agent_id,last_digest_seq,updated_at)
-                VALUES (?,?,?,?)
-                ON CONFLICT(group_id,agent_id) DO UPDATE SET
-                    last_digest_seq=excluded.last_digest_seq,
-                    updated_at=excluded.updated_at
-                """,
-                (g["group_id"], agent_id, scan_to, time.time()),
-            )
-            conn.commit()
+            _advance_digest_cursor(conn, agent_id, g["group_id"], scan_to)
             continue
         take = foreign[:5]
         last = take[-1]["seq"]
         pending = conn.execute(
             "SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND seq>? AND seq<=? AND sender_agent<>? AND (expires_at IS NULL OR expires_at > ?)",
-            (g["group_id"], g["last_digest_seq"], latest, agent_id, time.time()),
+            (g["group_id"], seen, latest, agent_id, time.time()),
         ).fetchone()["c"]
         lines = [f"[group:{g['group_id']} topic:{g['topic']}] seq={first}-{scan_to} digest={len(take)} of {pending} unread (own posts not shown)"]
         for r in take:
@@ -137,38 +147,30 @@ def poll_group_digest(agent_id: str, conn: sqlite3.Connection) -> dict[str, Any]
     return None
 
 
-def commit_group_digest(conn: sqlite3.Connection, agent_id: str, message: dict[str, Any]) -> None:
-    """Advance the digest cursor, but only once the adapter accepted the digest."""
+def commit_group_digest(
+    conn: sqlite3.Connection, agent_id: str, message: dict[str, Any], *,
+    last_error: str | None = None, retry_count: int = 0,
+) -> None:
+    """Advance the digest cursor once delivery or a dead-letter entry is recorded."""
     now_ts = time.time()
-    payload = json.loads(message["payload"])
-    ensure_thread(conn, message["thread_id"], agent_id, [agent_id])
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,
-            message_type,urgency,payload,attachments,ttl_seconds,expires_at,status,delivered_at,acked_at,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            message["message_id"], message["thread_id"], None, agent_id,
-            message["to_agent"], "system", "normal",
-            json.dumps(payload, ensure_ascii=False), "[]", 86400,
-            now_ts + 86400, "acked", now_ts, now_ts, now_ts,
-        ),
-    )
-    # UPSERT, matching poll_group_digest's own-only branch: a bare UPDATE
-    # matched 0 rows when no group_read_state row existed, the cursor never
-    # moved, and the same digest re-injected every poll forever.
-    conn.execute(
-        """
-        INSERT INTO group_read_state (group_id,agent_id,last_digest_seq,updated_at)
-        VALUES (?,?,?,?)
-        ON CONFLICT(group_id,agent_id) DO UPDATE SET
-            last_digest_seq=excluded.last_digest_seq,
-            updated_at=excluded.updated_at
-        """,
-        (message["_group_id"], agent_id, message["_digest_seq"], time.time()),
-    )
-    conn.commit()
+    accepted_at = now_ts if last_error is None else None
+    with nullcontext() if conn.in_transaction else tx(conn):
+        ensure_thread(conn, message["thread_id"], agent_id, [agent_id])
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO messages (message_id,thread_id,idempotency_key,from_agent,to_agent,
+                message_type,urgency,payload,attachments,ttl_seconds,expires_at,status,delivered_at,acked_at,
+                created_at,last_error,retry_count)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                message["message_id"], message["thread_id"], None, agent_id,
+                message["to_agent"], "system", "normal", message["payload"], "[]", 86400,
+                now_ts + 86400, "acked" if last_error is None else "dead", accepted_at, accepted_at,
+                now_ts, last_error, retry_count,
+            ),
+        )
+        _advance_digest_cursor(conn, agent_id, message["_group_id"], message["_digest_seq"])
 
 
 __all__ = ["commit_group_digest", "materialize_attachments", "poll_group_digest"]

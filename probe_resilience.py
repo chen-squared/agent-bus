@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from buslib.adapters.base import AdapterError, TransientAdapterError, is_transient_error
+from buslib.adapters.base import AdapterError, DeliveryUnknownError, TransientAdapterError, is_transient_error, native_send_error
 from buslib.adapters.opencode import OpencodeAdapter
 from buslib.agents import resolve_opencode_cli
 
@@ -50,6 +51,8 @@ sys.exit(0)
 
 
 def probe_opencode_cli_upgrade() -> None:
+    assert isinstance(native_send_error("Error: failed to connect to application socket"), TransientAdapterError)
+    assert isinstance(native_send_error("connection reset while awaiting response"), DeliveryUnknownError)
     with tempfile.TemporaryDirectory(prefix="bus-oc-cli-") as tmp:
         fake_home = Path(tmp) / "home"
         cli_root = fake_home / "Library" / "Application Support" / "ai.opencode.desktop" / "cli"
@@ -223,7 +226,111 @@ def probe_notifier_restart_resilience() -> None:
             run_cli("down", "--agent-id", "oc-peer", "--force")
 
 
+def probe_delivery_attempts() -> None:
+    with tempfile.TemporaryDirectory(prefix="bus-attempts-") as tmp:
+        root = Path(tmp)
+        db = root / "bus.db"
+        attempts = root / "crash-attempts"
+        release = root / "release"
+        script = root / "notify.py"
+        script.write_text(
+            "import os, sys, time\n"
+            "from pathlib import Path\n"
+            "thread = os.environ['AGENT_BUS_THREAD_ID']\n"
+            "if thread in {'deferred', 'a-deferred'}:\n"
+            "    sys.exit('service unavailable')\n"
+            "if thread == 'c-permanent':\n"
+            "    sys.exit('conversation not found')\n"
+            "if thread == 'crash':\n"
+            "    root = Path(__file__).parent\n"
+            "    with (root / 'crash-attempts').open('a') as f:\n"
+            "        print(os.environ['AGENT_BUS_MESSAGE_ID'], file=f)\n"
+            "    deadline = time.monotonic() + 15\n"
+            "    while not (root / 'release').exists() and time.monotonic() < deadline:\n"
+            "        time.sleep(0.02)\n"
+        )
+        env = {
+            **{k: v for k, v in os.environ.items() if not k.startswith("AGENT_BUS_")},
+            "AGENT_BUS_HOME": tmp,
+            "PROBE_PYTHON": sys.executable,
+            "PROBE_NOTIFY": str(script),
+        }
+        cli = [sys.executable, str(HERE / "bus.py")]
+
+        def run_cli(*args: str) -> dict:
+            result = subprocess.run([*cli, *args], env=env, cwd=HERE, capture_output=True, text=True, timeout=15, check=True)
+            return json.loads(result.stdout)
+
+        def send(thread: str) -> str:
+            return run_cli("send", "--from", "sender", "--to", "receiver", "--thread-id", thread, "--text", thread)["message_id"]
+
+        def wait_for_message(message_id: str, status: str) -> tuple:
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
+                with closing(sqlite3.connect(db)) as conn:
+                    row = conn.execute(
+                        "SELECT status,retry_count,last_error FROM messages WHERE message_id=?", (message_id,)
+                    ).fetchone()
+                if row and row[0] == status:
+                    return row
+                time.sleep(0.03)
+            raise AssertionError((message_id, status, (root / "logs/notifier-receiver.log").read_text()))
+
+        for agent in ("sender", "receiver"):
+            run_cli("register", "--agent-id", agent, "--agent-type", "command")
+        for group in ("a-deferred", "b-healthy", "c-permanent"):
+            run_cli("group", "create", "--from", "sender", "--group-id", group, "--topic", group)
+            run_cli("group", "join", "--agent-id", "receiver", "--group-id", group)
+            run_cli("group", "send", "--from", "sender", "--group-id", group, "--text", group)
+        first = send("deferred")
+        # More than one batch's worth of failed messages must let a fresh message through.
+        for _ in range(25):
+            send("deferred")
+        healthy = send("healthy")
+        start = (
+            "up", "--agent-id", "receiver", "--adapter", "command", "--notify-cmd",
+            'exec "$PROBE_PYTHON" "$PROBE_NOTIFY"', "--poll", "0.05", "--outbox-flush", "0",
+        )
+        try:
+            pid = run_cli(*start)["notifier"]["pid"]
+            wait_for_message(healthy, "acked")
+            wait_for_message("group-digest-b-healthy-1-receiver", "acked")
+            assert wait_for_message(first, "queued") == ("queued", 0, "service unavailable")
+            with closing(sqlite3.connect(db)) as conn:
+                state = conn.execute(
+                    "SELECT last_digest_seq FROM group_read_state WHERE group_id='a-deferred' AND agent_id='receiver'"
+                ).fetchone()
+            assert state is None or state == (0,), state
+
+            interrupted = send("crash")
+            deadline = time.monotonic() + 6
+            while not attempts.exists() or not attempts.read_text().splitlines():
+                assert time.monotonic() < deadline, "notify command never started"
+                time.sleep(0.03)
+            os.kill(pid, signal.SIGKILL)
+            release.touch()
+            assert run_cli(*start, "--force")["notifier"]["pid"] != pid
+
+            dead = wait_for_message(interrupted, "dead")
+            assert dead[1] == 0 and "notifier stopped" in dead[2], dead
+            wait_for_message(send("after-restart"), "acked")
+            assert attempts.read_text().splitlines() == [interrupted]
+
+            run_cli("dlq", "retry", "--agent-id", "receiver", "--message-id", interrupted)
+            wait_for_message(interrupted, "acked")
+            assert attempts.read_text().splitlines() == [interrupted, interrupted]
+
+            digest_id = "group-digest-c-permanent-1-receiver"
+            assert wait_for_message(digest_id, "dead") == ("dead", 5, "conversation not found")
+            unread = run_cli("group", "messages", "--group-id", "c-permanent", "--agent-id", "receiver")
+            assert [message["seq"] for message in unread["messages"]] == [1], unread
+        finally:
+            release.touch()
+            run_cli("down", "--agent-id", "receiver", "--force")
+
+
 if __name__ == "__main__":
     probe_opencode_cli_upgrade()
     probe_notifier_restart_resilience()
+    probe_delivery_attempts()
     print("RESILIENCE_OK")

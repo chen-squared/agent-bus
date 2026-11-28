@@ -23,6 +23,17 @@ def sweep_expired(conn: sqlite3.Connection) -> tuple[int, int]:
         (ts,),
     )
     dead = cur.rowcount
+    conn.execute(
+        "DELETE FROM delivery_attempts WHERE retry_after IS NOT NULL AND group_id IS NULL"
+        " AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.message_id=delivery_attempts.message_id"
+        " AND m.to_agent=delivery_attempts.agent_id AND m.status IN ('queued','delivered') AND m.acked_at IS NULL)"
+    )
+    conn.execute(
+        "DELETE FROM delivery_attempts WHERE retry_after IS NOT NULL AND group_id IS NOT NULL"
+        " AND NOT EXISTS (SELECT 1 FROM group_members m JOIN groups g USING (group_id)"
+        " WHERE m.group_id=delivery_attempts.group_id AND m.agent_id=delivery_attempts.agent_id"
+        " AND m.status='active' AND g.status='active')"
+    )
     conn.commit()
     return expired, dead
 

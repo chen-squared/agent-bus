@@ -185,6 +185,12 @@ check("逐轮排空后外部消息一条不漏、一条不重",
       rendered == expected, f"渲染 {len(rendered)} / 应有 {len(expected)}")
 check("最后一条 alice 的消息确实送达 bob", 26 in rendered, f"max rendered={max(rendered) if rendered else None}")
 
+print("I 手动读完的消息不再唤醒")
+check("bob send", send("bob", "alice reads this directly"))
+rc, out, err = cli("group", "catch-up", "--group-id", "g1", "--agent-id", "alice")
+check("alice catch-up", rc == 0, err or out)
+check("poll 不再为已读消息生成摘要", digest_of("alice") is None)
+
 print()
 print("RESULT:", "ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}")
 sys.exit(1 if FAIL else 0)

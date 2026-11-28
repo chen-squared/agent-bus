@@ -92,6 +92,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
             delivered_at REAL NOT NULL,
             PRIMARY KEY(agent_id, message_id)
         );
+        CREATE TABLE IF NOT EXISTS delivery_attempts (
+            agent_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            group_id TEXT,
+            digest TEXT,
+            retry_after REAL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(agent_id, message_id)
+        );
         CREATE TABLE IF NOT EXISTS peers (
             peer_name TEXT PRIMARY KEY,
             host TEXT,
@@ -201,6 +210,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
         if col not in columns("messages"):
             conn.execute(ddl)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_correlation ON messages(correlation_id,message_type)")
+    if "retry_count" not in columns("delivery_attempts"):
+        with tx(conn):
+            if "retry_count" not in columns("delivery_attempts"):
+                conn.execute("ALTER TABLE delivery_attempts ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 

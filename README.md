@@ -142,7 +142,8 @@ agent-bus up --agent-id dev-agy --adapter antigravity \
 - `--session-id` must be the target conversation UUID (`ANTIGRAVITY_CONVERSATION_ID`).
 - `--antigravity-ls-address host:port` (or `AGENT_BUS_ANTIGRAVITY_LS_ADDRESS` /
   `ANTIGRAVITY_LS_ADDRESS`) selects the local Antigravity language server.
-- `ANTIGRAVITY_CSRF_TOKEN` must be present in the environment; it is never
+  Use `localhost` or a loopback IP. Conversation state checks reject redirects.
+- `ANTIGRAVITY_CSRF_TOKEN` must be present in the environment. It is never
   written to CLI argv, PID files, or logs.
 - `--cli /path/to/agentapi` overrides CLI autodetection (`agentapi` on `PATH`,
   `~/.gemini/antigravity/bin/agentapi`, or `ANTIGRAVITY_AGENTAPI_EXE`).
@@ -154,6 +155,7 @@ agent-bus up --agent-id dev-agy --adapter antigravity \
 - Like Codex, delivery is pointer-first: peer text never enters `agentapi`
   arguments. If Antigravity restarts and changes `ANTIGRAVITY_LS_ADDRESS` or
   `ANTIGRAVITY_CSRF_TOKEN`, restart the notifier with `agent-bus up ... --force`.
+  The running notifier stays online if the replacement fails its startup checks.
 - If the target Antigravity conversation runs shell commands in Standard
   Sandbox mode, start the notifier with a Python (>= 3.10) accessible inside
   the workspace sandbox and keep `AGENT_BUS_HOME` inside the workspace or `/tmp`
@@ -303,7 +305,7 @@ Group send gates are not HTTP statuses: each is a JSON object printed to **stder
   - All three need an operator identity: pass `--agent-id <you>` or export `AGENT_BUS_AGENT`. `dlq retry` now resets `expires_at`, so the requeued message survives the next sweep.
 - Verification trap after upgrading digest code: a restarted notifier whose cursor already equals latest emits no new rows, so fresh group traffic is required to exercise the new path; zero new rows right after restart means no traffic, not a broken fix.
 
-Queued sends are stored, not synchronous-network. A running notifier flushes up to three pending outbox rows every 30s (`AGENT_BUS_OUTBOX_FLUSH`, 0 disables it), so cross-machine delivery no longer depends on someone running `agent-bus outbox flush`. A send result may include `"target_stale":true` when the recipient has no recent heartbeat/notifier; the row is still queued, so start a notifier or poll `inbox` and `ack`. Audit event JSON lines go to stderr; stdout is the command result object. For `opencode` and watched `command` adapters a busy recipient is retried and reached later; for `tmux`, pane-busy consumes the retry budget and dead-letters after 5 attempts, so later delivery is not guaranteed there.
+Queued sends are stored, not synchronous-network. A running notifier flushes up to three pending outbox rows every 30s (`AGENT_BUS_OUTBOX_FLUSH`, 0 disables it), so cross-machine delivery no longer depends on someone running `agent-bus outbox flush`. A send result may include `"target_stale":true` when the recipient has no recent heartbeat/notifier; the row is still queued, so start a notifier or poll `inbox` and `ack`. Audit event JSON lines go to stderr; stdout is the command result object.
 
 ### 6. Group chat
 
@@ -321,10 +323,10 @@ agent-bus group catch-up --group-id demo-group --agent-id "$ME"
 Three cursors per member live in `group_read_state` and never write each other:
 
 - `last_read_seq` -- what you claim to have seen. Written by `group read --seq <n>` (monotone: a lower seq is ignored, and the value is clamped, see below) and by your own `group send`, which bumps it to your new seq. Read by the send gate and by backpressure.
-- `last_digest_seq` -- the notifier's render watermark. Written by the notifier after a successful inject. Read by `poll_group_digest` to pick the next window.
+- `last_digest_seq` -- the notifier's watermark. It advances past resolved deliveries and messages that need no wake.
 - `last_served_seq` -- the highest seq `group messages` actually handed you. Written only by `group messages`. Read by `group read` to clamp it.
 
-So a manual `group read` never suppresses digests -- verified with 60 unread: `read --seq 60` first, the notifier still rendered all 60 in 12 pages of 5, no gaps and no dupes. And a digest never clears the read gate, and never raises `last_served_seq` either: a digest is not a receipt for a gap you chose to acknowledge.
+The notifier starts after the greater of `last_read_seq` and `last_digest_seq`, so a manual `group read` skips wakes for the acknowledged messages. Only a read or send advances the read gate.
 
 `group messages` is capped (`--limit`, default 50, `0` means counters only) and pages the **oldest** unread rows while reporting `latest_seq`, so one capped call plus one `read --seq <latest>` used to mark the unseen tail as read: with 60 unread the call returns seq 1-50, `read --seq 60` landed the cursor on 60, and seq 51-60 were gone from the unread view without anyone ever seeing them. The rows were never deleted -- they stay in `group_messages` -- but the unread view no longer pointed at them. `group history` exposes stored rows (member-only, no cursor movement) for audit and for late joiners who need sender/order context.
 
@@ -354,7 +356,8 @@ The CLI is universal. The adapter determines how delivery happens:
 - `antigravity`: verifies conversation state via `ConversationService/GetConversation` and delivers pointer prompts via `agentapi send-message`
 - `command`: runs `AGENT_NOTIFY_CMD` template with placeholders; official generic reference path below
 - `tmux`: pane injection after idle check (final fallback only; prefer a command or inbox-file listener because terminal injection races typing)
-- Transient target errors (busy panes, cancelling turns, connection refused / restarting local server, timeouts) defer with exponential backoff (capped at `AGENT_BUS_TRANSIENT_BACKOFF_MAX`, default 15s) without consuming the 5-retry DLQ budget; permanent errors still dead-letter after 5 attempts.
+- Confirmed temporary target failures, such as a cancelling turn or refused connection, defer delivery with exponential backoff (capped at `AGENT_BUS_TRANSIENT_BACKOFF_MAX`, default 15s). Other transient errors defer their own message or group while delivery continues for the rest. Direct messages and group digests move to the dead-letter queue after five permanent failures.
+- When a send loses its acknowledgement or the notifier stops during delivery, the message moves to the dead-letter queue with `delivery outcome unknown`. Check the receiving chat before using `agent-bus dlq retry`. Original group messages remain available through `agent-bus group messages`.
 
 Verified Claude Code wake recipe (peer-tested, byte-identical): `command` adapter appends a pointer triple to an inbox file, an async Stop hook runs a wake script that exits nonzero when the file is non-empty, the session wakes and pulls full text via `agent-bus message show` for 1-1 pointers, or for `group-digest-*` pointers (message show resolves them for active members, owner row or bounded reconstruction; `agent-bus group messages` remains fallback) (text never crosses a shell). The listener is unbounded (mkdir lock plus pid/heartbeat, no AGENT_BUS_WAKE_LIMIT); it is hooked on both Stop and UserPromptSubmit (timeout 3600) so coverage spans turn boundaries and the start of each turn (measured keepalive 1s, 104s, 381s, 473s; arrival-to-wake stays ~2s). Coverage is near-continuous but not continuous: while a wake is being handled there is no live listener, so messages arriving then wait for the next hook event.
 

@@ -593,6 +593,19 @@ def cmd_up(args: argparse.Namespace) -> int:
             "hint": "use `agent-bus up ... --force` to replace it",
         })))
         return 0
+    if existing is not None:
+        # Session health alone cannot verify that the replacement's CLI works.
+        argv = [*_notifier_argv(args), "--check-adapter"]
+        try:
+            result = subprocess.run(
+                argv, cwd=args.cwd, env=env, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=35,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SystemExit(f"error: could not check replacement notifier: {exc}") from None
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise SystemExit(f"error: replacement notifier check failed (existing notifier kept): {detail}")
     # Authenticate/register before stopping a working notifier. A bad token or
     # missing session should fail without creating an offline window.
     registration = _register(args)

@@ -336,11 +336,16 @@ def cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
-def fetch_inbox(conn: sqlite3.Connection, agent_id: str, status: str | None, limit: int) -> list[sqlite3.Row]:
+def fetch_inbox(
+    conn: sqlite3.Connection, agent_id: str, status: str | None, limit: int, *, ready_only: bool = False,
+) -> list[sqlite3.Row]:
     require_agent(conn, agent_id)
     # Expiry is filtered by the query below; bulk status sweeps belong to
     # sweep_expired, not to every inbox read (which wrote on every poll tick).
-    sql = "SELECT * FROM messages WHERE to_agent=?"
+    sql = "SELECT messages.* FROM messages"
+    if ready_only:
+        sql += " LEFT JOIN delivery_attempts a ON a.agent_id=messages.to_agent AND a.message_id=messages.message_id"
+    sql += " WHERE to_agent=?"
     params: list[Any] = [agent_id]
     if status == "undelivered":
         sql += " AND status IN ('queued','delivered') AND acked_at IS NULL"
@@ -352,8 +357,15 @@ def fetch_inbox(conn: sqlite3.Connection, agent_id: str, status: str | None, lim
     else:
         sql += " AND acked_at IS NULL"
     sql += " AND (expires_at IS NULL OR expires_at > ?)"
-    params.append(now())
-    sql += " ORDER BY created_at ASC, message_id ASC LIMIT ?"
+    ts = now()
+    params.append(ts)
+    if ready_only:
+        sql += " AND (a.message_id IS NULL OR a.retry_after <= ?)"
+        params.append(ts)
+    sql += " ORDER BY "
+    if ready_only:
+        sql += "a.retry_after IS NOT NULL, a.retry_after, "
+    sql += "messages.created_at ASC, messages.message_id ASC LIMIT ?"
     params.append(limit)
     return conn.execute(sql, params).fetchall()
 

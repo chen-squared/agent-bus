@@ -419,7 +419,8 @@ store-and-forward messages include a receipt and dedupe on `message_id`.
   no HTTP layer here, so there are no 409/429 statuses; the strings are
   `must confirm latest message first`, `rate limited`, `group ceiling reached`,
   `group backpressure: too many unread participants`.
-- Notifier digest: one digest per unseen watermark.
+- Each notifier skips messages through the greater of `last_read_seq` and
+  `last_digest_seq`. A manual read stops those messages from waking an agent again.
 - CLI: `group create/join/leave/close/list/messages/history/read/catch-up/send/status`.
   `send` reports `target_stale=true` for a recipient without a recent
   heartbeat/notifier; the message is still queued. Audit event JSON is emitted
